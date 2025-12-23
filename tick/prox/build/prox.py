@@ -459,6 +459,14 @@ class _NotImplementedProx(_RangeMixin):
 
     def value(self, coeffs: np.ndarray) -> float:
         return 0.0
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+
+    def call(self, coeffs: np.ndarray, step: object, out: np.ndarray) -> None:
+        raise NotImplementedError("Proximal operator not yet ported to Python")
+
+    def value(self, coeffs: np.ndarray) -> float:
+        raise NotImplementedError("Proximal operator not yet ported to Python")
 
 
 ProxMultiDouble = ProxMultiFloat = _NotImplementedProx
