@@ -473,7 +473,7 @@ class Test(unittest.TestCase):
             self.a0.readonly_prop = x
 
         msg = "can't set attribute"
-        if sys.version_info[1] == 11:
+        if sys.version_info[1] >= 11:
             msg = "property 'readonly_prop' of 'A0' object has no setter"
         self.assertRaisesRegex(AttributeError, msg, frop, 45)
 

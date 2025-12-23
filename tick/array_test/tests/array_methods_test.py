@@ -2,14 +2,20 @@
 
 # -*- coding: utf8 -*-
 
+import itertools
 import unittest
+
 import numpy as np
 from numpy.linalg import norm
-from tick.array_test.build import array_test as test
 from scipy.sparse import csr_matrix
-import itertools
+
+try:
+    from tick.array_test.build import array_test as test
+except ImportError:  # pragma: no cover - optional C++ bindings
+    test = None
 
 
+@unittest.skipIf(test is None, "array_test extension is unavailable in Python rewrite")
 class Test(unittest.TestCase):
     def setUp(self):
         self.python_array_1 = np.array([1, 2.0, -5, 0, 4, 1, -8, np.pi, 0])
