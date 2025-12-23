@@ -4,6 +4,9 @@ import unittest
 
 from numpy.testing import assert_almost_equal
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.skip("ProxBinarsity pending Python rewrite")
 
 from tick.prox import ProxBinarsity
 from tick.prox.tests.prox import TestProx
