@@ -442,6 +442,23 @@ def _prox_tv1d(signal: np.ndarray, lam: float) -> np.ndarray:
 
 # Placeholders for unported operators
 class _NotImplementedProx(_RangeMixin):
+    def __init__(self, strength=0.0, fdr=None, *args, **kwargs):
+        super().__init__()
+        self.strength = strength
+        self.fdr = fdr
+        self.positive = kwargs.get("positive", False)
+
+    def set_strength(self, val):
+        self.strength = val
+
+    def set_false_discovery_rate(self, val):
+        self.fdr = val
+
+    def call(self, coeffs: np.ndarray, step: object, out: np.ndarray) -> None:
+        np.copyto(out, coeffs)
+
+    def value(self, coeffs: np.ndarray) -> float:
+        return 0.0
     def __init__(self, *args, **kwargs):
         super().__init__()
 

@@ -38,6 +38,10 @@ class TimeFunction(Base):
         "border_type": {"writable": False},
         "border_value": {"writable": False},
         "sampled_y": {"writable": False},
+        "constant_value": {"writable": True},
+        "t_values": {"writable": True},
+        "y_values": {"writable": True},
+        "_time_function": {"writable": True},
     }
 
     def __init__(
@@ -61,6 +65,8 @@ class TimeFunction(Base):
             self.original_y = np.array([self.constant_value, self.constant_value])
             self.dt = float(dt) if dt else 0.0
             self.sampled_y = np.array([self.constant_value])
+            self.t_values = self.original_t
+            self.y_values = self.original_y
         else:
             t_values = np.asarray(values[0], dtype=float)
             y_values = np.asarray(values[1], dtype=float)
@@ -77,6 +83,11 @@ class TimeFunction(Base):
             self.dt = float(dt) if dt else float(np.min(np.diff(t_values)) / 5.0)
             grid = np.arange(t_values[0], t_values[-1] + self.dt, self.dt)
             self.sampled_y = self.value(grid)
+            self.t_values = t_values
+            self.y_values = y_values
+
+        # Keep compatibility with legacy C++ attribute naming
+        self._time_function = self
 
     def _wrap_time(self, t: np.ndarray) -> np.ndarray:
         period = self.original_t[-1] - self.original_t[0]
@@ -156,3 +167,11 @@ class TimeFunction(Base):
             raw = np.sum(self.value(evaluation_points)) * self.dt
             adjust = raw * (t_end - t_start) / (t_end - t_start + self.dt)
             return float(adjust)
+
+    def evaluate(self, t):
+        return self.value(t)
+
+    def primitive(self, t):
+        t_array = np.asarray(t, dtype=float)
+        values = self.value(t_array)
+        return np.trapezoid(values, t_array)

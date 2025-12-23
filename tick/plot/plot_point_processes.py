@@ -2,8 +2,10 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
-from typing import Optional, List
-from tick.hawkes.simulation.base import SimuPointProcess
+from typing import Optional, List, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - imported lazily to avoid circular deps
+    from tick.hawkes.simulation.base import SimuPointProcess
 
 
 def plot_point_process(point_process, plot_intensity=None, n_points=10000,
@@ -199,7 +201,7 @@ def _extract_process_interval(plot_nodes, end_time, timestamps,
 
 
 def qq_plots(
-        point_process: Optional[SimuPointProcess] = None,
+        point_process: Optional["SimuPointProcess"] = None,
         residuals: Optional[List[np.ndarray]] = None,
         plot_nodes=None,
         node_names=None,

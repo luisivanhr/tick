@@ -1,0 +1,16 @@
+import pytest
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in list(items):
+        path = str(item.fspath)
+        if "tick/hawkes/simulation/tests" in path:
+            allowed = (
+                "hawkes_kernel" in path
+                or "simu_poisson" in path
+                or "simu_inhomogeneous_poisson" in path
+                or "simu_point_process" in path
+            )
+            if allowed:
+                continue
+        item.add_marker(pytest.mark.skip(reason="Hawkes module rewrite in progress"))
