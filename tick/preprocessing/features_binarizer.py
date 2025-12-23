@@ -134,7 +134,11 @@ class FeaturesBinarizer(Base, BaseEstimator, TransformerMixin):
         self.reset()
 
     def reset(self):
-        self._set("one_hot_encoder", OneHotEncoder(sparse=True))
+        try:
+            encoder = OneHotEncoder(sparse_output=True)
+        except TypeError:
+            encoder = OneHotEncoder(sparse=True)
+        self._set("one_hot_encoder", encoder)
         self._set("mapper", {})
         self._set("feature_type", {})
         self._set("_fitted", False)
@@ -421,7 +425,7 @@ class FeaturesBinarizer(Base, BaseEstimator, TransformerMixin):
         if method == 'quantile':
             quantile_cuts = np.linspace(0, 100, n_cuts + 2)
             boundaries = np.percentile(feature, quantile_cuts,
-                                       interpolation="nearest")
+                                       method="nearest")
             # Only keep distinct bins boundaries
             boundaries = np.unique(boundaries)
         elif method == 'linspace':

@@ -7,3 +7,8 @@
 from tick.base.opsys import add_to_path_if_windows
 
 add_to_path_if_windows(__file__)
+
+from . import hawkes_inference
+from .hawkes_inference import *  # noqa: F401,F403
+
+__all__ = hawkes_inference.__all__

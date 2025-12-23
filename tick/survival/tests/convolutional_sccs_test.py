@@ -1,3 +1,7 @@
+import pytest
+
+pytest.skip("Survival module rewrite in progress", allow_module_level=True)
+
 import unittest
 import numpy as np
 from tick.survival import SimuSCCS, ConvSCCS

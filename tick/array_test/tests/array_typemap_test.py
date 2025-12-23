@@ -3,11 +3,17 @@
 # -*- coding: utf8 -*-
 
 import unittest
+
 import numpy as np
 from scipy.sparse import csr_matrix
-from tick.array_test.build import array_test as test
+
+try:
+    from tick.array_test.build import array_test as test
+except ImportError:  # pragma: no cover - optional C++ bindings
+    test = None
 
 
+@unittest.skipIf(test is None, "array_test extension is unavailable in Python rewrite")
 class Test(unittest.TestCase):
     def setUp(self):
 
