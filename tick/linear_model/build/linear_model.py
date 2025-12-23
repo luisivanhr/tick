@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+import scipy.sparse as sp
 
 
 def _prepare_features_and_intercept(features, coeffs, fit_intercept):
@@ -29,6 +30,41 @@ class _BaseGLM:
     @property
     def dtype(self):
         return self.features.dtype
+
+    # --- Attribute plumbing expected by BaseMeta ---
+    def set_fit_intercept(self, fit_intercept):
+        self.fit_intercept = bool(fit_intercept)
+
+    def get_fit_intercept(self):
+        return self.fit_intercept
+
+    def set_n_threads(self, n_threads):
+        self.n_threads = int(n_threads)
+
+    def get_n_threads(self):
+        return self.n_threads
+
+    # --- Serialization support ---
+    def compare(self, other):
+        if not isinstance(other, _BaseGLM):
+            return False
+        same_meta = (
+            self.fit_intercept == other.fit_intercept
+            and self.n_threads == other.n_threads
+            and self.n_features == other.n_features
+            and self.n_samples == other.n_samples
+        )
+        if not same_meta:
+            return False
+
+        def _eq(arr1, arr2):
+            if sp.issparse(arr1) or sp.issparse(arr2):
+                return sp.issparse(arr1) and sp.issparse(arr2) and np.allclose(
+                    arr1.toarray(), arr2.toarray()
+                )
+            return np.allclose(arr1, arr2)
+
+        return _eq(self.features, other.features) and _eq(self.labels, other.labels)
 
 
 class ModelLinRegFloat(_BaseGLM):

@@ -1,3 +1,13 @@
+"""Python placeholders for solver C++ bindings.
+
+These lightweight classes mimic the attribute plumbing expected by the Python
+solver wrappers so parameter setters/getters work during the rewrite, even
+though optimization is not yet delegated to native implementations.
+"""
+
+from __future__ import annotations
+
+import numpy as np
 """Python placeholders for solver C++ bindings."""
 
 # Randomization types used by stochastic solvers
@@ -14,6 +24,57 @@ SVRG_StepType_BarzilaiBorwein = "bb"
 
 class _BaseSolver:
     def __init__(self, *args, **kwargs):
+        self._record_every = 1
+        self._step = 0.0
+        self._starting_iterate = None
+        self._prox = None
+        self._model = None
+        self._prev_obj = None
+
+    # --- basic hooks used by wrappers ---
+    def set_model(self, model, *args, **kwargs):
+        self._model = model
+        return self
+
+    def set_prox(self, prox, *args, **kwargs):
+        self._prox = prox
+        return self
+
+    def set_starting_iterate(self, iterate):
+        self._starting_iterate = None if iterate is None else np.array(iterate, copy=True)
+
+    def set_step(self, step):
+        self._step = step
+
+    def get_step(self):
+        return self._step
+
+    def set_record_every(self, record_every):
+        self._record_every = int(record_every)
+
+    def get_record_every(self):
+        return self._record_every
+
+    def set_prev_obj(self, prev_obj):
+        self._prev_obj = prev_obj
+
+    # --- API placeholders required by specific solvers ---
+    def set_variance_reduction(self, *args, **kwargs):
+        return self
+
+    def set_step_type(self, *args, **kwargs):
+        return self
+
+    # --- minimal solve/serialization helpers ---
+    def solve(self, *args, **kwargs):
+        # Simply keep any starting iterate as the minimizer placeholder
+        return self
+
+    def get_minimizer(self, out):
+        if self._starting_iterate is None:
+            out[:] = 0
+        else:
+            out[:] = self._starting_iterate
         pass
 
     def set_model(self, *args, **kwargs):
