@@ -95,10 +95,12 @@ class ModelLogRegDouble(ModelLogRegFloat):
 
 
 class ModelPoisRegFloat(_BaseGLM):
+
     def __init__(self, features, labels, fit_intercept=True, n_threads=1,
                  link="exponential"):
         super().__init__(features, labels, fit_intercept, n_threads)
         self.link = link
+
 
     def loss(self, coeffs):
         linear_term, _ = _prepare_features_and_intercept(self.features, coeffs, self.fit_intercept)
