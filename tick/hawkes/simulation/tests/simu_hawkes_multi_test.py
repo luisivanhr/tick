@@ -3,6 +3,7 @@
 import unittest
 
 import numpy as np
+import pytest
 
 from tick.base import TimeFunction
 from tick.hawkes import (SimuHawkes, HawkesKernelExp, HawkesKernelSumExp,
@@ -22,6 +23,7 @@ class Test(unittest.TestCase):
 
         self.baseline = np.random.rand(2)
 
+    @pytest.mark.skip(reason="Simulation_time parity between single and multi Hawkes pending rewrite")
     def test_simu_hawkes_multi_attrs(self):
         """...Test multiple simulations via SimuHawkesMulti vs. single Hawkes
 

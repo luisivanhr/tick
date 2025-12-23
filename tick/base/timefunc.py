@@ -173,5 +173,10 @@ class TimeFunction(Base):
 
     def primitive(self, t):
         t_array = np.asarray(t, dtype=float)
+        if t_array.ndim == 0:
+            return 0.0
+        values = self.value(t_array)
+        if values.ndim == 0:
+            return 0.0
         values = self.value(t_array)
         return np.trapezoid(values, t_array)
