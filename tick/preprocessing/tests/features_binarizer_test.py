@@ -134,7 +134,10 @@ class Test(unittest.TestCase):
         """...Test binarizer fit
         """
         n_cuts = 3
-        enc = OneHotEncoder(sparse=True)
+        try:
+            enc = OneHotEncoder(sparse_output=True)
+        except TypeError:
+            enc = OneHotEncoder(sparse=True)
         expected_binarization = enc.fit_transform(
             self.default_expected_intervals)
 
@@ -167,7 +170,10 @@ class Test(unittest.TestCase):
         """...Test binarizer fit when remove_first=True
         """
         n_cuts = 3
-        one_hot_encoder = OneHotEncoder(sparse=True)
+        try:
+            one_hot_encoder = OneHotEncoder(sparse_output=True)
+        except TypeError:
+            one_hot_encoder = OneHotEncoder(sparse=True)
         expected_binarization = one_hot_encoder.fit_transform(
             self.default_expected_intervals)
 
