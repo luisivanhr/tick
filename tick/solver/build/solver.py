@@ -8,6 +8,7 @@ though optimization is not yet delegated to native implementations.
 from __future__ import annotations
 
 import numpy as np
+"""Python placeholders for solver C++ bindings."""
 
 # Randomization types used by stochastic solvers
 RandType_perm = "perm"
@@ -74,6 +75,16 @@ class _BaseSolver:
             out[:] = 0
         else:
             out[:] = self._starting_iterate
+        pass
+
+    def set_model(self, *args, **kwargs):
+        return self
+
+    def set_prox(self, *args, **kwargs):
+        return self
+
+    def solve(self, *args, **kwargs):
+        return None
 
 
 class SGDDouble(_BaseSolver):
