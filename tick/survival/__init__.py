@@ -11,10 +11,18 @@ from .model_coxreg_partial_lik import ModelCoxRegPartialLik
 from .model_sccs import ModelSCCS
 
 from .simu_coxreg import SimuCoxReg, SimuCoxRegWithCutPoints
-from .simu_sccs import SimuSCCS
-from .convolutional_sccs import ConvSCCS
+
+try:  # Hawkes bindings are still being rewritten
+    from .simu_sccs import SimuSCCS
+    from .convolutional_sccs import ConvSCCS
+except Exception:  # pragma: no cover - placeholder path during migration
+    SimuSCCS = None
+    ConvSCCS = None
 
 __all__ = [
-    "ModelCoxRegPartialLik", "SimuSCCS", "ModelSCCS", "ConvSCCS",
-    "kaplan_meier", "nelson_aalen"
+    "ModelCoxRegPartialLik", "ModelSCCS", "kaplan_meier", "nelson_aalen",
+    "SimuCoxReg", "SimuCoxRegWithCutPoints"
 ]
+
+if SimuSCCS is not None:
+    __all__.extend(["SimuSCCS", "ConvSCCS"])

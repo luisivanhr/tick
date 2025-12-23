@@ -7,3 +7,8 @@
 from tick.base.opsys import add_to_path_if_windows
 
 add_to_path_if_windows(__file__)
+
+from . import hawkes_simulation
+from .hawkes_simulation import *  # noqa: F401,F403
+
+__all__ = hawkes_simulation.__all__

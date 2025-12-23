@@ -2,7 +2,8 @@
 
 import copy
 import multiprocessing
-from multiprocessing import Pool
+
+from joblib import Parallel, delayed
 
 import numpy as np
 
@@ -168,8 +169,14 @@ class SimuHawkesMulti(Simu):
         return self._simulations[i]
 
     def _simulate(self):
-        """ Launches a series of n_simulations Hawkes simulation in a thread
-        pool
+        """Launch a series of Hawkes simulations in parallel.
+
+        The previous multiprocessing pool has been replaced with joblib to
+        mirror the parallel dispatch used elsewhere in the rewrite and to keep
+        configuration consistent once C++ backends are removed.
         """
-        with Pool(self.n_threads) as p:
-            self._simulations = p.map(simulate_single, self._simulations)
+
+        n_jobs = self.n_threads if self.n_threads > 0 else -1
+        self._simulations = Parallel(n_jobs=n_jobs)(
+            delayed(simulate_single)(simu) for simu in self._simulations
+        )

@@ -19,3 +19,10 @@ def required():
 
 
 add_to_path_if_windows(__file__, [required])
+
+from .hawkes_model import (
+    ModelHawkesExpKernLeastSq,
+    ModelHawkesExpKernLogLik,
+    ModelHawkesSumExpKernLeastSq,
+    ModelHawkesSumExpKernLogLik,
+)
