@@ -7,3 +7,9 @@
 from tick.base.opsys import add_to_path_if_windows
 
 add_to_path_if_windows(__file__)
+
+# Pure-Python shim implementations
+from . import base as base_module
+from .base import *  # noqa: F401,F403
+
+__all__ = getattr(base_module, "__all__", [])
