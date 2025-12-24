@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+__pure_python__ = True
+
 import math
 from dataclasses import dataclass
 from typing import Iterable, Optional, Union

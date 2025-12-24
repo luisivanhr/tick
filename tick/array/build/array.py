@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+__pure_python__ = True
+
 from pathlib import Path
 from typing import Union
 
@@ -15,21 +17,29 @@ def _as_path(path: Union[str, Path]) -> Path:
 
 def _save_dense(path: Union[str, Path], array: np.ndarray) -> None:
     path = _as_path(path)
+    with path.open("wb") as handle:
+        np.save(handle, array)
     np.save(path, array)
 
 
 def _load_dense(path: Union[str, Path]) -> np.ndarray:
     path = _as_path(path)
+    with path.open("rb") as handle:
+        return np.load(handle, allow_pickle=False)
     return np.load(path, allow_pickle=False)
 
 
 def _save_sparse(path: Union[str, Path], array: sparse.spmatrix) -> None:
     path = _as_path(path)
+    with path.open("wb") as handle:
+        sparse.save_npz(handle, array, compressed=False)
     sparse.save_npz(path, array, compressed=False)
 
 
 def _load_sparse(path: Union[str, Path]) -> sparse.spmatrix:
     path = _as_path(path)
+    with path.open("rb") as handle:
+        return sparse.load_npz(handle)
     return sparse.load_npz(path)
 
 

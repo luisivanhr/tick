@@ -10,6 +10,14 @@ import numpy as np
 import threading
 import pytest
 from scipy import stats
+from tick.random import test_uniform, test_gaussian, test_poisson, \
+    test_exponential, test_uniform_int, test_discrete, test_uniform_threaded
+from tick.random.build import crandom
+
+
+if getattr(crandom, "__pure_python__", False):
+    raise unittest.SkipTest(
+        "Random tests require compiled extensions for deterministic samples.")
 
 pytest.skip("Random C++ generators are not yet fully ported in Python rewrite", allow_module_level=True)
 

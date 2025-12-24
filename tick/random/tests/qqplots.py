@@ -4,6 +4,11 @@ import statsmodels.api as sm
 from matplotlib import pyplot as plt
 from tick.random import test_uniform, test_gaussian, test_poisson, \
     test_exponential, test_uniform_int, test_discrete, test_uniform_threaded
+from tick.random.build import crandom
+
+
+if getattr(crandom, "__pure_python__", False):
+    raise SystemExit("Random qqplot helpers require compiled extensions.")
 
 
 class QQplot:
