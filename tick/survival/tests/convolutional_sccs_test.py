@@ -18,11 +18,17 @@ class Test(unittest.TestCase):
         ]
         self.n_features = len(self.n_lags)
         self.n_correlations = 2
-        # Create data
+        self.features = None
+        self.labels = None
+        self.censoring = None
+
+    def _load_sim_data(self):
+        if self.features is not None:
+            return
         sim = SimuSCCS(n_cases=500, n_intervals=10, n_features=self.n_features,
                        n_lags=self.n_lags, verbose=False, seed=self.seed,
                        coeffs=self.coeffs, n_correlations=self.n_correlations)
-        _, self.features, self.labels, self.censoring, self.coeffs =\
+        _, self.features, self.labels, self.censoring, self.coeffs = \
             sim.simulate()
 
     def test_LearnerSCCS_coefficient_groups(self):
@@ -97,6 +103,7 @@ class Test(unittest.TestCase):
     def test_LearnerSCCS_confidence_intervals(self):
         def fit(clazz):
             self.setUp()
+            self._load_sim_data()
             lrn = clazz(n_lags=self.n_lags, penalized_features=[])
             coeffs, _ = lrn.fit(self.features, self.labels, self.censoring)
             p_features, p_labels, p_censoring = lrn._preprocess_data(
@@ -137,6 +144,7 @@ class Test(unittest.TestCase):
         fit(StreamConvSCCS)
 
     def test_LearnerSCCS_score(self):
+        self._load_sim_data()
         lrn = ConvSCCS(n_lags=self.n_lags, penalized_features=[],
                        random_state=self.seed)
         lrn.fit(self.features, self.labels, self.censoring)
@@ -148,6 +156,7 @@ class Test(unittest.TestCase):
         lrn_scores = []
         def fit(lrn):
             self.setUp()
+            self._load_sim_data()
             lrn.fit(self.features, self.labels, self.censoring)
             score = lrn.score()
             tv_range = (-5, -1)
