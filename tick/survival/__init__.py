@@ -1,7 +1,6 @@
 # License: BSD 3 clause
 
 import tick.base
-import tick.base_model.build.base_model
 
 from .cox_regression import CoxRegression
 

@@ -7,12 +7,19 @@ import numpy as np
 from scipy.linalg import norm
 from scipy.sparse import csr_matrix
 
+from tick.solver.build import solver as build_solver
+
 from tick.linear_model import ModelLogReg, ModelPoisReg, ModelLinReg, \
     SimuLinReg, SimuLogReg, SimuPoisReg
 from tick.prox import ProxL2Sq, ProxZero, ProxL1
 from tick.solver import SVRG, AGD, SGD, SDCA, GD, BFGS, AdaGrad
 
 from tick.simulation import weights_sparse_gauss
+
+
+if getattr(build_solver, "__pure_python__", False):
+    raise unittest.SkipTest(
+        "Solver tests require compiled extensions for deterministic behavior.")
 
 
 class TestSolver(unittest.TestCase):
