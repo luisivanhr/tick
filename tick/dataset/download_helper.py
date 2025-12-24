@@ -102,8 +102,8 @@ def download_tick_dataset(dataset_path, data_home=None, verbose=True):
         File path of the downloaded data
     """
     dataset_url = BASE_URL % dataset_path
-    download_dataset(dataset_url, dataset_path, data_home=data_home,
-                     verbose=verbose)
+    return download_dataset(dataset_url, dataset_path, data_home=data_home,
+                            verbose=verbose)
 
 
 def fetch_tick_dataset(dataset_path, data_home=None, n_features=None,

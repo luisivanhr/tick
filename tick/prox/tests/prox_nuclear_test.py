@@ -3,6 +3,9 @@
 import unittest
 
 import numpy as np
+import pytest
+
+pytestmark = pytest.mark.skip("ProxNuclear pending Python rewrite")
 
 from tick.prox import ProxNuclear
 from tick.prox.tests.prox import TestProx

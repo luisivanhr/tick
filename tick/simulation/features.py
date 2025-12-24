@@ -1,7 +1,7 @@
 # License: BSD 3 clause
 
 import numpy as np
-from scipy.linalg.special_matrices import toeplitz
+from scipy.linalg import toeplitz
 
 
 def features_normal_cov_uniform(n_samples: int = 200, n_features: int = 30,
@@ -29,7 +29,9 @@ def features_normal_cov_uniform(n_samples: int = 200, n_features: int = 30,
         n_samples realization of a Gaussian vector with the described
         covariance
     """
-    C = np.random.uniform(size=(n_features, n_features), dtype=dtype)
+    C = np.random.uniform(size=(n_features, n_features))
+    if dtype != "float64":
+        C = C.astype(dtype)
     np.fill_diagonal(C, 1.0)
     cov = 0.5 * (C + C.T)
     features = np.random.multivariate_normal(

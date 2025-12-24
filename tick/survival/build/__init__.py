@@ -19,3 +19,9 @@ def required():
             os.environ["PATH"] = p + os.pathsep + os.environ["PATH"]
 
 add_to_path_if_windows(__file__, [required])
+
+from .survival import (
+    ModelCoxRegPartialLikFloat,
+    ModelCoxRegPartialLikDouble,
+    ModelSCCS,
+)
