@@ -10,6 +10,8 @@ The package lives under `our-hawkes/`, while the import package is
 from our_hawkes.hawkes import SimuHawkesExpKernels, HawkesExpKern
 ```
 
+See [PARITY.md](PARITY.md) for the current short tick Hawkes API parity matrix.
+
 The implementation intentionally avoids C++ extensions. It uses NumPy/SciPy for
 reference numerical work, optional Numba JIT helpers for hot loops, and Python
 parallelism for repeated simulations.
