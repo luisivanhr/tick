@@ -17,11 +17,52 @@ from our_hawkes.hawkes import (
     HawkesKernelExp,
     HawkesKernelPowerLaw,
     HawkesKernelSumExp,
+    HawkesSumExpKern,
     ModelHawkesExpKernLogLik,
     SimuHawkesExpKernels,
     SimuHawkesMulti,
     SimuPoissonProcess,
 )
+
+
+class HawkesPublicAPITest(unittest.TestCase):
+    def test_hawkes_public_all_exports_are_stable(self):
+        import our_hawkes.hawkes as hawkes_api
+
+        tick_hawkes_public_names = {
+            "TimeFunction",
+            "HawkesKernel",
+            "HawkesKernel0",
+            "HawkesKernelExp",
+            "HawkesKernelPowerLaw",
+            "HawkesKernelSumExp",
+            "HawkesKernelTimeFunc",
+            "SimuPoissonProcess",
+            "SimuInhomogeneousPoisson",
+            "SimuHawkes",
+            "SimuHawkesExpKernels",
+            "SimuHawkesSumExpKernels",
+            "SimuHawkesMulti",
+            "ModelHawkesExpKernLeastSq",
+            "ModelHawkesExpKernLogLik",
+            "ModelHawkesSumExpKernLeastSq",
+            "ModelHawkesSumExpKernLogLik",
+            "HawkesExpKern",
+            "HawkesSumExpKern",
+            "HawkesADM4",
+            "HawkesSumGaussians",
+            "HawkesEM",
+            "HawkesBasisKernels",
+            "HawkesConditionalLaw",
+            "HawkesCumulantMatching",
+            "HawkesCumulantMatchingPyT",
+            "HawkesCumulantMatchingTf",
+        }
+
+        exported_names = set(hawkes_api.__all__)
+        self.assertEqual(set(), tick_hawkes_public_names - exported_names)
+        for name in hawkes_api.__all__:
+            self.assertTrue(hasattr(hawkes_api, name), name)
 
 
 class ValidationTest(unittest.TestCase):
@@ -123,6 +164,36 @@ class ModelAndLearnerTest(unittest.TestCase):
         values = learner.get_kernel_values(0, 0, np.linspace(0, 1, 4))
         self.assertEqual(values.shape, (4,))
 
+    def test_parametric_learner_solver_start_history_and_intensity_compat(self):
+        learner = HawkesExpKern(
+            1.2,
+            gofit="likelihood",
+            penalty="none",
+            solver="svrg",
+            max_iter=-1,
+            warm_start=True,
+        )
+        learner.fit(self.events, end_times=self.end_time, start=0.4)
+        np.testing.assert_allclose(learner.coeffs, np.full(6, 0.4))
+        self.assertEqual(learner.history[-1]["n_iter"], 0)
+
+        learner.fit(self.events, end_times=self.end_time)
+        np.testing.assert_allclose(learner.coeffs, np.full(6, 0.4))
+
+        with self.assertRaisesRegex(ValueError, "call `fit` before `score`"):
+            HawkesExpKern(1.0).score()
+
+        intensities, times = learner.estimated_intensity(self.events, None, end_time=self.end_time)
+        self.assertEqual(len(intensities), 2)
+        self.assertEqual(intensities[0].shape, times.shape)
+
+        sumexp = HawkesSumExpKern([1.0, 2.0], solver="l-bfgs-b", penalty="elasticnet", max_iter=1)
+        sumexp.fit(self.events, end_times=self.end_time)
+        self.assertEqual(sumexp.adjacency.shape, (2, 2, 2))
+        self.assertGreaterEqual(len(sumexp.history), 1)
+        with self.assertRaisesRegex(ValueError, "unknown penalty"):
+            HawkesSumExpKern([1.0, 2.0], penalty="nuclear")
+
     def test_em_and_adm4_fit(self):
         em = HawkesEM(kernel_support=1.0, kernel_size=4, max_iter=2).fit(self.events, self.end_time)
         self.assertEqual(em.kernel.shape, (2, 2, 4))
@@ -130,6 +201,28 @@ class ModelAndLearnerTest(unittest.TestCase):
 
         adm4 = HawkesADM4(1.0, max_iter=2, C=10.0, verbose=False).fit(self.events, self.end_time)
         self.assertEqual(adm4.adjacency.shape, (2, 2))
+
+    def test_adm4_start_score_objective_and_intensity_compat(self):
+        with self.assertRaisesRegex(ValueError, "call `fit` before `score`"):
+            HawkesADM4(1.0).score()
+
+        learner = HawkesADM4(1.0, max_iter=2, C=10.0, lasso_nuclear_ratio=0.7, verbose=False)
+        learner.fit(
+            self.events,
+            self.end_time,
+            baseline_start=np.zeros(2),
+            adjacency_start=np.full((2, 2), 0.2),
+        )
+        self.assertEqual(learner.coeffs.shape, (6,))
+        self.assertTrue(math.isfinite(learner.score()))
+        self.assertTrue(math.isfinite(learner.objective(learner.coeffs)))
+        self.assertGreaterEqual(len(learner.history), 1)
+        self.assertAlmostEqual(learner._prox_l1.strength, 0.07)
+        self.assertAlmostEqual(learner._prox_nuclear.strength, 0.03)
+
+        intensities, times = learner.estimated_intensity(self.events, None, end_time=self.end_time)
+        self.assertEqual(len(intensities), 2)
+        self.assertEqual(intensities[0].shape, times.shape)
 
     def test_cumulant_matching_and_tf_optional(self):
         cumulant = HawkesCumulantMatching(1.0).fit(self.events, self.end_time)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+import multiprocessing
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -20,18 +21,30 @@ from .kernels import (
     HawkesKernelExp,
     HawkesKernelSumExp,
 )
+from .numeric import exp_kernel_convolution, sumexp_kernel_convolution
 
 
 class Simu(BaseEstimator):
     """Base simulation class."""
 
     def __init__(self, seed: int | None = None, verbose: bool = True):
+        self._seed: int | None = None
+        self._rng = np.random.default_rng()
         self.seed = seed
         self.verbose = verbose
         self.time_start: str | None = None
         self.time_end: str | None = None
         self.time_elapsed: float | None = None
-        self._rng = np.random.default_rng(None if seed is None or seed < 0 else seed)
+
+    @property
+    def seed(self) -> int | None:
+        return self._seed
+
+    @seed.setter
+    def seed(self, value: int | None) -> None:
+        self._seed = None if value is None else int(value)
+        rng_seed = None if self._seed is None or self._seed < 0 else self._seed
+        self._rng = np.random.default_rng(rng_seed)
 
     @property
     def name(self) -> str:
@@ -70,15 +83,34 @@ class SimuPointProcess(Simu):
         verbose: bool = True,
     ):
         super().__init__(seed=seed, verbose=verbose)
+        self._time = 0.0
+        self._end_time: float | None = None
         self.end_time = end_time
         self.max_jumps = max_jumps
-        self._time = 0.0
         self._timestamps: list[list[float]] = []
         self._intensity_track_step = -1.0
+        self._next_track_time = 0.0
         self._tracked_times: list[float] = []
         self._tracked_intensity: list[list[float]] = []
         self._tracked_compensator: list[np.ndarray] = []
         self._threshold_negative_intensity = False
+
+    @property
+    def end_time(self) -> float | None:
+        return self._end_time
+
+    @end_time.setter
+    def end_time(self, value: float | None) -> None:
+        if value is None:
+            self._end_time = None
+            return
+        value = float(value)
+        if value < self.simulation_time:
+            raise ValueError(
+                "This point process has already been simulated until time "
+                f"{self.simulation_time:f}, you cannot set a smaller end_time ({value:f})"
+            )
+        self._end_time = value
 
     @property
     def n_nodes(self) -> int:
@@ -120,6 +152,7 @@ class SimuPointProcess(Simu):
         self._timestamps = [[] for _ in range(self.n_nodes)]
         self._tracked_intensity = [[] for _ in range(self.n_nodes)]
         self._tracked_times = []
+        self._next_track_time = 0.0
         self._tracked_compensator = [np.asarray([], dtype=float) for _ in range(self.n_nodes)]
 
     def reset(self) -> None:
@@ -129,6 +162,7 @@ class SimuPointProcess(Simu):
     def track_intensity(self, intensity_track_step: float = -1.0) -> None:
         self._intensity_track_step = float(intensity_track_step)
         self._tracked_times = []
+        self._next_track_time = 0.0
         self._tracked_intensity = [[] for _ in range(self.n_nodes)]
 
     def is_intensity_tracked(self) -> bool:
@@ -137,60 +171,82 @@ class SimuPointProcess(Simu):
     def threshold_negative_intensity(self, allow: bool = True) -> None:
         self._threshold_negative_intensity = bool(allow)
 
-    def _intensity_at(self, t: float) -> np.ndarray:
+    def _intensity_at(self, t: float, include_current_jumps: bool = False) -> np.ndarray:
+        del include_current_jumps
         raise NotImplementedError
 
-    def _total_intensity_bound(self, t: float) -> float:
-        intensity = self._intensity_at(t)
+    def _total_intensity_bound(self, t: float, include_current_jumps: bool = True) -> float:
+        intensity = self._handle_negative_intensity(
+            self._intensity_at(t, include_current_jumps=include_current_jumps)
+        )
         return float(np.sum(np.maximum(intensity, 0.0)))
 
-    def _record_intensity(self, t: float) -> None:
+    def _record_intensity(self, t: float, include_current_jumps: bool = True) -> None:
         if not self.is_intensity_tracked():
             return
-        values = self._intensity_at(t)
+        values = self._handle_negative_intensity(
+            self._intensity_at(t, include_current_jumps=include_current_jumps)
+        )
         self._tracked_times.append(float(t))
         for i, value in enumerate(values):
             self._tracked_intensity[i].append(float(value))
 
+    def _record_regular_intensity_until(self, stop_time: float) -> None:
+        if not self.is_intensity_tracked():
+            return
+        while self._next_track_time + self._intensity_track_step < stop_time:
+            self._next_track_time += self._intensity_track_step
+            self._record_intensity(self._next_track_time)
+
+    def _handle_negative_intensity(self, intensity: np.ndarray) -> np.ndarray:
+        if np.any(intensity < 0):
+            if self._threshold_negative_intensity:
+                return np.maximum(intensity, 0.0)
+            raise RuntimeError(
+                "Simulation stopped because intensity went negative "
+                "(you could call ``threshold_negative_intensity`` to allow it)"
+            )
+        return intensity
+
     def _simulate(self):
         if self.end_time is None and self.max_jumps is None:
             raise ValueError("Either end_time or max_jumps must be set")
+        if self.end_time is not None and float(self.end_time) == self.simulation_time:
+            warnings.warn(
+                f"This process has already been simulated until time {float(self.end_time):f}",
+                UserWarning,
+                stacklevel=2,
+            )
 
-        self.reset()
         end_time = math.inf if self.end_time is None else float(self.end_time)
         max_jumps = math.inf if self.max_jumps is None else int(self.max_jumps)
-        next_track_time = 0.0
-        self._record_intensity(0.0)
+        if end_time < self._time:
+            raise ValueError(
+                "This point process has already been simulated until time "
+                f"{self._time:f}, you cannot simulate it until {end_time:f}"
+            )
+        if self._time == 0.0 and self.n_total_jumps == 0 and not self._tracked_times:
+            self._record_intensity(0.0)
 
         while self._time < end_time and self.n_total_jumps < max_jumps:
-            bound = self._total_intensity_bound(self._time)
+            bound = self._total_intensity_bound(self._time, include_current_jumps=True)
             if bound <= 0 or not np.isfinite(bound):
                 if math.isfinite(end_time):
+                    self._record_regular_intensity_until(end_time)
                     self._time = end_time
                 break
 
             candidate_time = self._time + float(self._rng.exponential(1.0 / bound))
-
-            if self.is_intensity_tracked():
-                while next_track_time + self._intensity_track_step < min(candidate_time, end_time):
-                    next_track_time += self._intensity_track_step
-                    self._record_intensity(next_track_time)
+            self._record_regular_intensity_until(min(candidate_time, end_time))
 
             if candidate_time >= end_time:
                 self._time = end_time
                 break
 
             self._time = candidate_time
-            intensity = self._intensity_at(self._time)
-            if np.any(intensity < 0):
-                if self._threshold_negative_intensity:
-                    intensity = np.maximum(intensity, 0.0)
-                else:
-                    raise ValueError(
-                        "Simulation stopped because intensity went negative; "
-                        "call threshold_negative_intensity(True) to clip it"
-                    )
-
+            intensity = self._handle_negative_intensity(
+                self._intensity_at(self._time, include_current_jumps=False)
+            )
             total_intensity = float(np.sum(intensity))
             if total_intensity <= 0 or self._rng.uniform() * bound > total_intensity:
                 continue
@@ -200,7 +256,7 @@ class SimuPointProcess(Simu):
             node = int(np.searchsorted(cumulative, threshold, side="right"))
             node = min(node, self.n_nodes - 1)
             self._timestamps[node].append(self._time)
-            self._record_intensity(self._time)
+            self._record_intensity(self._time, include_current_jumps=True)
 
         return self
 
@@ -214,20 +270,29 @@ class SimuPointProcess(Simu):
                 raise ValueError("timestamps must be one-dimensional")
             if arr.size and np.any(np.diff(arr) < 0):
                 raise ValueError(f"timestamps for node {node} must be sorted")
+            if arr.size and arr[0] < 0:
+                raise ValueError("timestamps must be non-negative")
             arrays.append(arr)
         if end_time is None:
             end_time = max((float(arr[-1]) for arr in arrays if arr.size), default=0.0)
         self.end_time = float(end_time)
-        self._time = float(end_time)
-        self._timestamps = [list(map(float, arr)) for arr in arrays]
-        if self.is_intensity_tracked():
-            self._tracked_times = []
-            self._tracked_intensity = [[] for _ in range(self.n_nodes)]
-            n_steps = int(math.floor(self.end_time / self._intensity_track_step))
-            for k in range(n_steps + 1):
-                self._record_intensity(k * self._intensity_track_step)
-            if not self._tracked_times or self._tracked_times[-1] < self.end_time:
-                self._record_intensity(self.end_time)
+        latest = max((float(arr[-1]) for arr in arrays if arr.size), default=0.0)
+        if self.end_time < latest:
+            raise ValueError(
+                f"end_time={self.end_time} is before latest timestamp {latest}"
+            )
+
+        events = sorted(
+            (float(t), node) for node, arr in enumerate(arrays) for t in arr
+        )
+        self.reset()
+        for jump_time, node in events:
+            self._record_regular_intensity_until(jump_time)
+            self._time = jump_time
+            self._record_intensity(jump_time, include_current_jumps=True)
+            self._timestamps[node].append(jump_time)
+        self._record_regular_intensity_until(float(self.end_time))
+        self._time = float(self.end_time)
         return self
 
     def store_compensator_values(self):
@@ -255,6 +320,7 @@ class SimuPoissonProcess(SimuPointProcess):
         verbose: bool = True,
         seed: int | None = None,
     ):
+        self._intensities_is_scalar = np.isscalar(intensities)
         self._intensities = np.atleast_1d(np.asarray(intensities, dtype=float))
         if np.any(self._intensities < 0):
             raise ValueError("Poisson intensities must be non-negative")
@@ -266,11 +332,14 @@ class SimuPoissonProcess(SimuPointProcess):
         return int(self._intensities.size)
 
     @property
-    def intensities(self) -> np.ndarray:
+    def intensities(self) -> float | np.ndarray:
+        if self._intensities_is_scalar:
+            return float(self._intensities[0])
         return self._intensities.copy()
 
-    def _intensity_at(self, t: float) -> np.ndarray:
+    def _intensity_at(self, t: float, include_current_jumps: bool = False) -> np.ndarray:
         del t
+        del include_current_jumps
         return self._intensities.copy()
 
     def _evaluate_compensator(self, node: int, t: float) -> float:
@@ -301,10 +370,12 @@ class SimuInhomogeneousPoisson(SimuPointProcess):
     def intensity_value(self, node: int, times: Any):
         return self.intensities_functions[node].value(times)
 
-    def _intensity_at(self, t: float) -> np.ndarray:
+    def _intensity_at(self, t: float, include_current_jumps: bool = False) -> np.ndarray:
+        del include_current_jumps
         return np.asarray([fn.value(t) for fn in self.intensities_functions], dtype=float)
 
-    def _total_intensity_bound(self, t: float) -> float:
+    def _total_intensity_bound(self, t: float, include_current_jumps: bool = True) -> float:
+        del include_current_jumps
         return float(sum(fn.future_bound(t) for fn in self.intensities_functions))
 
     def _evaluate_compensator(self, node: int, t: float) -> float:
@@ -418,18 +489,21 @@ class SimuHawkes(SimuPointProcess):
         arr = np.asarray(t_values, dtype=float)
         return np.vectorize(lambda t: self._baseline_value(i, float(t)), otypes=[float])(arr)
 
-    def _intensity_at(self, t: float) -> np.ndarray:
+    def _intensity_at(self, t: float, include_current_jumps: bool = False) -> np.ndarray:
         values = np.zeros(self.n_nodes, dtype=float)
         timestamps = self.timestamps
         for i in range(self.n_nodes):
             values[i] = self._baseline_value(i, t)
             for j in range(self.n_nodes):
-                values[i] += self.kernels[i, j].get_convolution(t, timestamps[j])
-        if np.any(values < 0) and self._threshold_negative_intensity:
-            values = np.maximum(values, 0.0)
+                values[i] += _kernel_convolution(
+                    self.kernels[i, j],
+                    t,
+                    timestamps[j],
+                    include_current_jumps=include_current_jumps,
+                )
         return values
 
-    def _total_intensity_bound(self, t: float) -> float:
+    def _total_intensity_bound(self, t: float, include_current_jumps: bool = True) -> float:
         timestamps = self.timestamps
         total = 0.0
         for i in range(self.n_nodes):
@@ -439,10 +513,18 @@ class SimuHawkes(SimuPointProcess):
                 if kernel.is_zero():
                     continue
                 if isinstance(kernel, (HawkesKernelExp, HawkesKernelSumExp)):
-                    total += max(kernel.get_convolution(t, timestamps[j]), 0.0)
+                    total += max(
+                        _kernel_convolution(
+                            kernel,
+                            t,
+                            timestamps[j],
+                            include_current_jumps=include_current_jumps,
+                        ),
+                        0.0,
+                    )
                 else:
                     for tj in timestamps[j]:
-                        if tj < t:
+                        if tj < t or (include_current_jumps and tj <= t):
                             total += kernel.future_bound(t - tj)
         return float(max(total, 0.0))
 
@@ -462,8 +544,11 @@ class SimuHawkes(SimuPointProcess):
         for i, j in product(range(self.n_nodes), range(self.n_nodes)):
             norms[i, j] = self.kernels[i, j].get_norm()
         if norms.size == 1:
-            return float(abs(norms[0, 0]))
+            return float(norms[0, 0])
         eigvals = np.linalg.eigvals(norms)
+        eigvals = np.real_if_close(eigvals)
+        if np.isrealobj(eigvals):
+            return float(np.max(eigvals.real))
         return float(np.max(np.abs(eigvals)))
 
     def mean_intensity(self) -> np.ndarray:
@@ -620,18 +705,38 @@ class SimuHawkesMulti(Simu):
             raise ValueError("n_simulations must be positive")
         self.hawkes_simu = hawkes_simu
         self.n_simulations = int(n_simulations)
-        self.n_threads = int(n_threads) if n_threads > 0 else None
+        self.n_threads = int(n_threads) if n_threads > 0 else multiprocessing.cpu_count()
         self._simulations = [copy.deepcopy(hawkes_simu) for _ in range(n_simulations)]
         super().__init__(seed=hawkes_simu.seed, verbose=hawkes_simu.verbose)
-        if self.seed is not None and self.seed >= 0:
-            self.reseed_simulations(self.seed)
 
-    def reseed_simulations(self, seed: int) -> None:
-        rng = np.random.default_rng(None if seed is None or seed < 0 else seed)
-        seeds = rng.integers(0, 2**31 - 1, size=self.n_simulations, dtype=np.int64)
+    @property
+    def seed(self) -> int | None:
+        return self.hawkes_simu.seed
+
+    @seed.setter
+    def seed(self, value: int | None) -> None:
+        if hasattr(self, "hawkes_simu") and hasattr(self, "_simulations"):
+            self.reseed_simulations(value)
+        else:
+            Simu.seed.fset(self, value)
+
+    def reseed_simulations(self, seed: int | None) -> None:
+        seed = None if seed is None else int(seed)
+        self._seed = seed
+        rng_seed = None if seed is None or seed < 0 else seed
+        self._rng = np.random.default_rng(rng_seed)
+        self.hawkes_simu.seed = seed
+        if seed is None or seed < 0:
+            seeds: list[int | None] = [None] * self.n_simulations
+        else:
+            seeds = [
+                int(sim_seed)
+                for sim_seed in self._rng.integers(
+                    0, 2**31 - 1, size=self.n_simulations, dtype=np.int64
+                )
+            ]
         for simulation, sim_seed in zip(self._simulations, seeds):
-            simulation.seed = int(sim_seed)
-            simulation._rng = np.random.default_rng(int(sim_seed))
+            simulation.seed = sim_seed
 
     @property
     def n_total_jumps(self) -> list[int]:
@@ -689,6 +794,33 @@ class SimuHawkesMulti(Simu):
 def _simulate_single(simulation: SimuHawkes) -> SimuHawkes:
     simulation.simulate()
     return simulation
+
+
+def _kernel_convolution(
+    kernel: HawkesKernel,
+    time: float,
+    timestamps: np.ndarray,
+    include_current_jumps: bool = False,
+) -> float:
+    if isinstance(kernel, HawkesKernelExp):
+        return exp_kernel_convolution(
+            time,
+            timestamps,
+            kernel.intensity,
+            kernel.decay,
+            include_current=include_current_jumps,
+        )
+    if isinstance(kernel, HawkesKernelSumExp):
+        return sumexp_kernel_convolution(
+            time,
+            timestamps,
+            kernel.intensities,
+            kernel.decays,
+            include_current=include_current_jumps,
+        )
+    if include_current_jumps:
+        return float(sum(kernel.get_value(time - tk) for tk in timestamps if tk <= time))
+    return kernel.get_convolution(time, timestamps)
 
 
 def _contains_time_function(value: Any) -> bool:

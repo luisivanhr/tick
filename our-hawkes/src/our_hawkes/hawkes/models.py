@@ -14,10 +14,13 @@ from our_hawkes.base import BaseEstimator, normalize_events
 
 from .numeric import (
     exp_feature_at_time,
+    exp_loglik_loss_scan,
     exp_primitive_sum,
     finite_difference_grad,
     finite_difference_hessian,
+    pack_realization,
     sumexp_feature_at_time,
+    sumexp_loglik_loss_scan,
     sumexp_primitive_sum,
 )
 
@@ -415,18 +418,8 @@ class ModelHawkesSumExpKernLeastSq(ModelHawkes):
 
 
 def _exp_loglik_loss_one(realization, end_time, baseline, adjacency, decays):
-    value = float((np.sum(baseline) - baseline.size) * end_time)
-    for i, j in product(range(baseline.size), range(baseline.size)):
-        value += adjacency[i, j] * exp_primitive_sum(end_time, realization[j], decays[i, j])
-    for i in range(baseline.size):
-        for t in realization[i]:
-            intensity = baseline[i]
-            for j in range(baseline.size):
-                intensity += adjacency[i, j] * exp_feature_at_time(float(t), realization[j], decays[i, j])
-            if intensity <= 0:
-                return np.inf
-            value -= np.log(intensity)
-    return float(value)
+    events, sizes = pack_realization(realization)
+    return exp_loglik_loss_scan(events, sizes, end_time, baseline, adjacency, decays)
 
 
 def _exp_loglik_grad_one(realization, end_time, baseline, adjacency, decays):
@@ -450,24 +443,8 @@ def _exp_loglik_grad_one(realization, end_time, baseline, adjacency, decays):
 
 
 def _sumexp_loglik_loss_one(realization, end_time, baseline, adjacency, decays):
-    n_nodes = baseline.size
-    n_decays = decays.size
-    value = float((np.sum(baseline) - n_nodes) * end_time)
-    tmp = np.empty(n_decays, dtype=float)
-    for i, j in product(range(n_nodes), range(n_nodes)):
-        sumexp_primitive_sum(end_time, realization[j], decays, tmp)
-        value += float(np.dot(adjacency[i, j, :], tmp))
-    features = np.empty(n_decays, dtype=float)
-    for i in range(n_nodes):
-        for t in realization[i]:
-            intensity = baseline[i]
-            for j in range(n_nodes):
-                sumexp_feature_at_time(float(t), realization[j], decays, features)
-                intensity += float(np.dot(adjacency[i, j, :], features))
-            if intensity <= 0:
-                return np.inf
-            value -= np.log(intensity)
-    return float(value)
+    events, sizes = pack_realization(realization)
+    return sumexp_loglik_loss_scan(events, sizes, end_time, baseline, adjacency, decays)
 
 
 def _sumexp_loglik_grad_one(realization, end_time, baseline, adjacency, decays):

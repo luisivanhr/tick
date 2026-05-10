@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import OptimizeResult, minimize
 
 
 def soft_threshold(x: np.ndarray, threshold: float) -> np.ndarray:
@@ -70,10 +70,12 @@ class ProxNuclear:
     n_rows: int | None = None
 
     def call(self, coeffs: np.ndarray, step: float = 1.0) -> np.ndarray:
+        input_was_vector = np.asarray(coeffs).ndim == 1
         matrix = self._matrix(coeffs)
         u, s, vh = np.linalg.svd(matrix, full_matrices=False)
         s = np.maximum(s - self.strength * step, 0.0)
-        return (u * s) @ vh
+        out = (u * s) @ vh
+        return out.ravel() if input_was_vector else out
 
     def value(self, coeffs: np.ndarray) -> float:
         matrix = self._matrix(coeffs)
@@ -109,10 +111,13 @@ def optimize_positive_coeffs(
     tol: float = 1e-5,
     jac: bool = True,
     callback: Callable[[np.ndarray], None] | None = None,
+    extra_penalty: Callable[[np.ndarray], float] | None = None,
+    extra_grad: Callable[[np.ndarray], np.ndarray] | None = None,
+    result_callback: Callable[[OptimizeResult], None] | None = None,
 ) -> np.ndarray:
     """Optimize a Hawkes model with non-negative coefficients."""
 
-    start = np.maximum(np.asarray(start, dtype=float), 1e-12)
+    start = np.maximum(np.asarray(start, dtype=float), 0.0)
     penalty = penalty.lower()
     if C is None or C <= 0:
         raise ValueError("C must be positive")
@@ -120,14 +125,43 @@ def optimize_positive_coeffs(
     strength = 0.0 if penalty == "none" else 1.0 / C
 
     def objective(x: np.ndarray) -> float:
+        if not np.all(np.isfinite(x)):
+            return 1e300
         value = model.loss(x)
-        return float(value + _penalty_value(x, penalty, strength, elastic_net_ratio, model))
+        if not np.isfinite(value):
+            return 1e300
+        try:
+            penalty_value = _penalty_value(x, penalty, strength, elastic_net_ratio, model)
+            if extra_penalty is not None:
+                penalty_value += float(extra_penalty(x))
+        except (FloatingPointError, np.linalg.LinAlgError, ValueError):
+            return 1e300
+        total = float(value + penalty_value)
+        return total if np.isfinite(total) else 1e300
 
     def gradient(x: np.ndarray) -> np.ndarray:
         grad = model.grad(x)
-        return grad + _penalty_grad(x, penalty, strength, elastic_net_ratio, model)
+        grad = grad + _penalty_grad(x, penalty, strength, elastic_net_ratio, model)
+        if extra_grad is not None:
+            grad = grad + extra_grad(x)
+        return np.nan_to_num(grad, nan=0.0, posinf=1e100, neginf=-1e100)
 
-    use_jac = jac and penalty != "nuclear"
+    if int(max_iter) <= 0:
+        if result_callback is not None:
+            result_callback(
+                OptimizeResult(
+                    x=start.copy(),
+                    fun=objective(start),
+                    jac=gradient(start) if jac and penalty != "nuclear" else None,
+                    nit=0,
+                    nfev=1,
+                    success=True,
+                    message="max_iter <= 0; returned starting point",
+                )
+            )
+        return start.copy()
+
+    use_jac = bool(jac and penalty != "nuclear" and (extra_penalty is None or extra_grad is not None))
     result = minimize(
         objective,
         start,
@@ -137,6 +171,8 @@ def optimize_positive_coeffs(
         callback=callback,
         options={"maxiter": int(max_iter), "ftol": float(tol), "gtol": float(tol)},
     )
+    if result_callback is not None:
+        result_callback(result)
     if not result.success and not np.isfinite(result.fun):
         raise RuntimeError(f"optimization failed: {result.message}")
     return np.maximum(np.asarray(result.x, dtype=float), 0.0)

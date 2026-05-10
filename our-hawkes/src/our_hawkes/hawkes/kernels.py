@@ -9,6 +9,13 @@ import numpy as np
 
 from our_hawkes.base import BaseEstimator, TimeFunction
 
+from .numeric import (
+    exp_kernel_convolution,
+    exp_kernel_primitive_convolution,
+    sumexp_kernel_convolution,
+    sumexp_kernel_primitive_convolution,
+)
+
 
 class HawkesKernel(BaseEstimator):
     """Base class for one entry of a Hawkes kernel matrix."""
@@ -156,6 +163,12 @@ class HawkesKernelExp(HawkesKernel):
         del n_steps
         return float(self.intensity)
 
+    def get_convolution(self, time: float, timestamps: np.ndarray) -> float:
+        return exp_kernel_convolution(time, timestamps, self.intensity, self.decay)
+
+    def get_primitive_convolution(self, time: float, timestamps: np.ndarray) -> float:
+        return exp_kernel_primitive_convolution(time, timestamps, self.intensity, self.decay)
+
     def get_plot_support(self) -> float:
         if self.decay <= 0:
             return 0.0
@@ -230,6 +243,12 @@ class HawkesKernelSumExp(HawkesKernel):
     def get_norm(self, n_steps: int = 10000) -> float:
         del n_steps
         return float(np.sum(self.intensities))
+
+    def get_convolution(self, time: float, timestamps: np.ndarray) -> float:
+        return sumexp_kernel_convolution(time, timestamps, self.intensities, self.decays)
+
+    def get_primitive_convolution(self, time: float, timestamps: np.ndarray) -> float:
+        return sumexp_kernel_primitive_convolution(time, timestamps, self.intensities, self.decays)
 
     def get_plot_support(self) -> float:
         positive = self.decays[self.decays > 0]
