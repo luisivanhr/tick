@@ -221,7 +221,6 @@ class TickModelPublicBehaviorTest(unittest.TestCase):
         self.assertAlmostEqual(batch.loss(coeffs), incremental.loss(coeffs), places=12)
         np.testing.assert_allclose(batch.grad(coeffs), incremental.grad(coeffs), atol=1e-12)
 
-    @unittest.skip("our-hawkes parity gap: ModelHawkesSumExpKernLeastSq.cast_period_length is not implemented")
     def test_sumexp_leastsq_cast_period_length(self):
         model = ModelHawkesSumExpKernLeastSq([1.0, 2.0], n_baselines=2, period_length=10.0)
         self.assertEqual(model.cast_period_length(5.0), 5.0)
@@ -278,13 +277,13 @@ class TickLearnerPublicBehaviorTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "kernel norms only"):
             learner.get_kernel_values(0, 0, np.array([0.1, 0.2]))
 
-    @unittest.skip("our-hawkes parity gap: learner plot_estimated_intensity and qq_plots methods are not implemented")
     def test_parametric_learner_plotting_helpers(self):
         learner = HawkesExpKern(1.0, max_iter=1).fit(self.events, end_times=self.end_time)
-        learner.plot_estimated_intensity(self.events, intensity_track_step=0.1)
-        learner.qq_plots(self.events)
+        intensity_fig = learner.plot_estimated_intensity(self.events, intensity_track_step=0.1, show=False)
+        qq_fig = learner.qq_plots(self.events, show=False)
+        self.assertGreaterEqual(len(intensity_fig.axes), 1)
+        self.assertGreaterEqual(len(qq_fig.axes), 1)
 
-    @unittest.skip("our-hawkes parity gap: objective is missing on HawkesEM, HawkesBasisKernels, and HawkesSumGaussians")
     def test_nonparametric_learner_objective_methods(self):
         em = HawkesEM(kernel_support=1.0, kernel_size=4, max_iter=1).fit(self.events, end_times=self.end_time)
         self.assertTrue(np.isfinite(em.objective(em.kernel)))
@@ -313,7 +312,6 @@ class TickPlotPublicBehaviorTest(unittest.TestCase):
             self.assertGreaterEqual(len(fig.axes), 1)
             plt.close(fig)
 
-    @unittest.skip("our-hawkes parity gap: tick plot_hawkes_baseline_and_kernels, plot_basis_kernels, and plot_timefunction are not implemented")
     def test_missing_tick_plot_helpers(self):
         self.assertTrue(hasattr(hawkes_plot, "plot_hawkes_baseline_and_kernels"))
         self.assertTrue(hasattr(hawkes_plot, "plot_basis_kernels"))
@@ -321,7 +319,6 @@ class TickPlotPublicBehaviorTest(unittest.TestCase):
 
 
 class TickDocumentedGapCompatibilityTest(unittest.TestCase):
-    @unittest.skip("our-hawkes parity gap: SimuHawkes.check_parameters_coherence is not implemented")
     def test_simu_hawkes_check_parameters_coherence_method(self):
         self.assertTrue(hasattr(SimuHawkes(n_nodes=1), "check_parameters_coherence"))
 

@@ -9,6 +9,38 @@ import numpy as np
 from scipy.optimize import OptimizeResult, minimize
 
 
+@dataclass
+class _BaseSolver:
+    step: float | None = None
+    tol: float = 1e-5
+    max_iter: int = 100
+    verbose: bool = False
+    print_every: int = 10
+    record_every: int = 10
+    seed: int | None = None
+    method: str = "L-BFGS-B"
+
+
+class GD(_BaseSolver):
+    pass
+
+
+class AGD(_BaseSolver):
+    pass
+
+
+class BFGS(_BaseSolver):
+    pass
+
+
+class SGD(_BaseSolver):
+    pass
+
+
+class SVRG(_BaseSolver):
+    pass
+
+
 def soft_threshold(x: np.ndarray, threshold: float) -> np.ndarray:
     return np.sign(x) * np.maximum(np.abs(x) - threshold, 0.0)
 

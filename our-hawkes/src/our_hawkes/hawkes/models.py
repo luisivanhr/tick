@@ -360,6 +360,15 @@ class ModelHawkesSumExpKernLeastSq(ModelHawkes):
             return np.asarray([0.0])
         return np.arange(self.n_baselines, dtype=float) * (self.period_length / self.n_baselines)
 
+    def cast_period_length(self, period_length: float | None = None) -> float:
+        """Return tick's C++ sentinel for an unset varying-baseline period."""
+
+        if period_length is None:
+            period_length = self.period_length
+        if period_length is None:
+            return float(np.finfo(np.float64).max)
+        return float(period_length)
+
     def _get_n_coeffs(self) -> int:
         return self.n_nodes * self.n_baselines + self.n_nodes * self.n_nodes * self.n_decays
 

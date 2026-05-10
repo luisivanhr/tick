@@ -191,7 +191,7 @@ class ModelAndLearnerTest(unittest.TestCase):
         sumexp.fit(self.events, end_times=self.end_time)
         self.assertEqual(sumexp.adjacency.shape, (2, 2, 2))
         self.assertGreaterEqual(len(sumexp.history), 1)
-        with self.assertRaisesRegex(ValueError, "unknown penalty"):
+        with self.assertRaisesRegex(ValueError, "``penalty`` must be one of"):
             HawkesSumExpKern([1.0, 2.0], penalty="nuclear")
 
     def test_em_and_adm4_fit(self):
@@ -206,7 +206,14 @@ class ModelAndLearnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "call `fit` before `score`"):
             HawkesADM4(1.0).score()
 
-        learner = HawkesADM4(1.0, max_iter=2, C=10.0, lasso_nuclear_ratio=0.7, verbose=False)
+        learner = HawkesADM4(
+            1.0,
+            max_iter=2,
+            C=10.0,
+            lasso_nuclear_ratio=0.7,
+            verbose=False,
+            record_every=1,
+        )
         learner.fit(
             self.events,
             self.end_time,

@@ -35,10 +35,10 @@ surface:
 
 This is not full tick parity. The current implementation is intended to be
 usable for Hawkes and point-process workflows while remaining pure Python.
-Known partial areas include exact tick optimizer behavior, some learner
-diagnostic/objective helpers, deep tick module import paths, exact compiled
-attribute semantics, and optional TensorFlow/PyTorch cumulant backends. See
-[PARITY.md](PARITY.md) for the more detailed status and gaps.
+Known partial areas include exact C++ RNG stream parity, deep tick module import
+paths, exact compiled attribute semantics, and optional TensorFlow/PyTorch
+cumulant solve backends. See
+[PARITY.md](PARITY.md) for the more detailed test-backed status and gaps.
 
 ## Examples
 
@@ -54,6 +54,10 @@ depending on `tick`.
 All example scripts are intended to run headlessly with Matplotlib's `Agg`
 backend.
 
+The notebook `examples/hawkes_time_rescaling_gof.ipynb` demonstrates
+time-rescaling goodness-of-fit diagnostics for univariate Hawkes processes with
+exponential, sum-exponential, power-law, and time-function kernels.
+
 ## Development
 
 Use the requested environment:
@@ -64,8 +68,13 @@ Use the requested environment:
 
 The current stabilization baseline is:
 
-- `unittest discover -s tests`: 67 tests passing, 6 skipped optional-backend or
-  intentionally unsupported parity cases.
+- `unittest discover -s tests`: 116 tests passing, 1 skipped documented parity
+  case.
+- `unittest discover -s tests\tick_equivalence`: 171 local tick Hawkes tests
+  inventoried in the equivalence ledger; current classification is 165 pass,
+  0 unresolved equivalence gaps, and 6 optional backend cases.
+- `tests\tick_equivalence\report_equivalence.py`: prints the ledger counts
+  by `pass`, `xfail_equivalence_gap`, and `skip_optional_backend`.
 - All scripts in `examples/`: smoke-tested successfully from this checkout.
 - Clean-directory import: verified with `PYTHONPATH` set to the absolute
   `our-hawkes/src` directory.

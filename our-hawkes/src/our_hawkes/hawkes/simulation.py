@@ -459,6 +459,22 @@ class SimuHawkes(SimuPointProcess):
     def n_nodes(self) -> int:
         return self._n_nodes
 
+    def check_parameters_coherence(self, kernels=None, baseline=None, n_nodes=None) -> None:
+        set_kernels = kernels is not None
+        set_baseline = baseline is not None
+        set_n_nodes = n_nodes is not None
+        if set_n_nodes and (set_kernels or set_baseline):
+            raise ValueError(
+                "n_nodes will be automatically calculated if baseline or kernels is set"
+            )
+        if not set_n_nodes and not set_kernels and not set_baseline:
+            raise ValueError("n_nodes must be given if neither kernels, nor baseline are given")
+        if set_kernels and set_baseline and len(kernels) != len(baseline):
+            raise ValueError(
+                "kernels and baseline have different length. "
+                f"kernels has length {len(kernels)}, whereas baseline has length {len(baseline)}."
+            )
+
     def set_kernel(self, i: int, j: int, kernel: HawkesKernel | float | int) -> None:
         self.kernels[i, j] = HawkesKernel0() if kernel == 0 else kernel
 
@@ -534,8 +550,9 @@ class SimuHawkes(SimuPointProcess):
         radius = self.spectral_radius()
         if not self.force_simulation and self.max_jumps is None and radius >= 1.0:
             raise ValueError(
-                "Simulation not launched because this Hawkes process is unstable "
-                f"(spectral radius {radius:.3g})"
+                "Simulation not launched as this Hawkes process is not stable "
+                f"(spectral radius of {radius:.2g}). You can use force_simulation "
+                "parameter if you really want to simulate it"
             )
         return super()._simulate()
 
