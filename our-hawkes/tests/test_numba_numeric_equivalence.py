@@ -1,3 +1,5 @@
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -14,6 +16,7 @@ from our_hawkes.hawkes import (
     ModelHawkesSumExpKernLogLik,
     SimuHawkesExpKernels,
     SimuHawkesSumExpKernels,
+    SimuPoissonProcess,
 )
 
 
@@ -202,6 +205,91 @@ class NumbaNumericEquivalenceTest(unittest.TestCase):
                 places=14,
             )
 
+        inhibitory_adjacency = np.array([[0.4, -0.3], [0.2, 0.1]], dtype=float)
+        self.assertAlmostEqual(
+            numeric.exp_intensity_bound(
+                time,
+                self.events,
+                self.sizes,
+                self.baseline,
+                inhibitory_adjacency,
+                self.exp_decays,
+                include_current=True,
+            ),
+            numeric.exp_intensity_bound_reference(
+                time,
+                self.events,
+                self.sizes,
+                self.baseline,
+                inhibitory_adjacency,
+                self.exp_decays,
+                include_current=True,
+            ),
+            places=14,
+        )
+        self.assertAlmostEqual(
+            numeric.sumexp_intensity_bound(
+                time,
+                self.events,
+                self.sizes,
+                self.baseline,
+                self.sumexp_adjacency,
+                self.sumexp_decays,
+                include_current=True,
+            ),
+            numeric.sumexp_intensity_bound_reference(
+                time,
+                self.events,
+                self.sizes,
+                self.baseline,
+                self.sumexp_adjacency,
+                self.sumexp_decays,
+                include_current=True,
+            ),
+            places=14,
+        )
+
+    def test_homogeneous_poisson_event_helper_matches_reference(self):
+        uniforms = np.array(
+            [
+                [0.10, 0.20],
+                [0.35, 0.85],
+                [0.40, 0.50],
+                [0.80, 0.10],
+            ],
+            dtype=float,
+        )
+        intensities = np.array([0.5, 1.0, 0.25], dtype=float)
+        ref_times = np.empty(uniforms.shape[0], dtype=float)
+        ref_nodes = np.empty(uniforms.shape[0], dtype=np.int64)
+        actual_times = np.empty(uniforms.shape[0], dtype=float)
+        actual_nodes = np.empty(uniforms.shape[0], dtype=np.int64)
+
+        ref = numeric.homogeneous_poisson_events_reference(
+            0.2,
+            2.0,
+            intensities,
+            uniforms,
+            ref_times,
+            ref_nodes,
+        )
+        actual = numeric.homogeneous_poisson_events(
+            0.2,
+            2.0,
+            intensities,
+            uniforms,
+            actual_times,
+            actual_nodes,
+        )
+        self.assertEqual(actual, ref)
+        np.testing.assert_allclose(actual_times[: actual[0]], ref_times[: ref[0]], rtol=1e-14, atol=1e-14)
+        np.testing.assert_array_equal(actual_nodes[: actual[0]], ref_nodes[: ref[0]])
+
+        first = SimuPoissonProcess([0.5, 1.0], end_time=5.0, seed=1234, verbose=False).simulate()
+        second = SimuPoissonProcess([0.5, 1.0], end_time=5.0, seed=1234, verbose=False).simulate()
+        for left, right in zip(first.timestamps, second.timestamps):
+            np.testing.assert_allclose(left, right, rtol=0.0, atol=0.0)
+
     def test_simulation_intensity_and_compensator_routes_match_reference_helpers(self):
         exp_simu = SimuHawkesExpKernels(
             self.exp_adjacency,
@@ -222,6 +310,19 @@ class NumbaNumericEquivalenceTest(unittest.TestCase):
             ),
             rtol=1e-14,
             atol=1e-14,
+        )
+        self.assertAlmostEqual(
+            exp_simu._total_intensity_bound(1.4, include_current_jumps=True),
+            numeric.exp_intensity_bound_reference(
+                1.4,
+                self.events,
+                self.sizes,
+                self.baseline,
+                self.exp_adjacency,
+                self.exp_decays,
+                include_current=True,
+            ),
+            places=14,
         )
         self.assertAlmostEqual(
             exp_simu._evaluate_compensator(1, self.end_time),
@@ -256,6 +357,19 @@ class NumbaNumericEquivalenceTest(unittest.TestCase):
             ),
             rtol=1e-14,
             atol=1e-14,
+        )
+        self.assertAlmostEqual(
+            sumexp_simu._total_intensity_bound(1.4, include_current_jumps=True),
+            numeric.sumexp_intensity_bound_reference(
+                1.4,
+                self.events,
+                self.sizes,
+                self.baseline,
+                self.sumexp_adjacency,
+                self.sumexp_decays,
+                include_current=True,
+            ),
+            places=14,
         )
         self.assertAlmostEqual(
             sumexp_simu._evaluate_compensator(0, self.end_time),
@@ -346,6 +460,130 @@ class NumbaNumericEquivalenceTest(unittest.TestCase):
             places=14,
         )
 
+    def test_packed_multi_realization_and_event_table_helpers(self):
+        realizations = [self.realization, [np.array([], dtype=float), np.array([0.3, 0.4])]]
+        events, sizes, end_times = numeric.pack_realizations(realizations, end_times=[2.0, 0.5])
+        self.assertEqual(events.shape, (2, 2, 3))
+        np.testing.assert_array_equal(sizes, np.array([[3, 3], [0, 2]]))
+        np.testing.assert_allclose(end_times, np.array([2.0, 0.5]))
+
+        times, nodes = numeric.pack_event_table(self.realization)
+        np.testing.assert_allclose(times, np.array([0.1, 0.2, 0.7, 0.9, 1.4, 1.6]))
+        np.testing.assert_array_equal(nodes, np.array([0, 1, 0, 1, 0, 1]))
+
+    def test_loglikelihood_gradients_match_references_and_model_gradients(self):
+        exp_grad = numeric.exp_loglik_grad_scan(
+            self.events,
+            self.sizes,
+            self.end_time,
+            self.baseline,
+            self.exp_adjacency,
+            self.exp_decays,
+        )
+        exp_ref = numeric.exp_loglik_grad_scan_reference(
+            self.events,
+            self.sizes,
+            self.end_time,
+            self.baseline,
+            self.exp_adjacency,
+            self.exp_decays,
+        )
+        np.testing.assert_allclose(exp_grad[0], exp_ref[0], rtol=1e-14, atol=1e-14)
+        np.testing.assert_allclose(exp_grad[1], exp_ref[1], rtol=1e-14, atol=1e-14)
+
+        shared_decay = 1.3
+        shared_decays = np.full((2, 2), shared_decay)
+        exp_model = ModelHawkesExpKernLogLik(shared_decay).fit(self.realization, self.end_time)
+        exp_coeffs = np.hstack((self.baseline, self.exp_adjacency.ravel()))
+        exp_expected = numeric.exp_loglik_grad_scan_reference(
+            self.events,
+            self.sizes,
+            self.end_time,
+            self.baseline,
+            self.exp_adjacency,
+            shared_decays,
+        )
+        np.testing.assert_allclose(
+            exp_model.grad(exp_coeffs),
+            np.hstack((exp_expected[0], exp_expected[1].ravel())) / sum(self.sizes),
+            rtol=1e-14,
+            atol=1e-14,
+        )
+
+        sumexp_grad = numeric.sumexp_loglik_grad_scan(
+            self.events,
+            self.sizes,
+            self.end_time,
+            self.baseline,
+            self.sumexp_adjacency,
+            self.sumexp_decays,
+        )
+        sumexp_ref = numeric.sumexp_loglik_grad_scan_reference(
+            self.events,
+            self.sizes,
+            self.end_time,
+            self.baseline,
+            self.sumexp_adjacency,
+            self.sumexp_decays,
+        )
+        np.testing.assert_allclose(sumexp_grad[0], sumexp_ref[0], rtol=1e-14, atol=1e-14)
+        np.testing.assert_allclose(sumexp_grad[1], sumexp_ref[1], rtol=1e-14, atol=1e-14)
+
+        sumexp_model = ModelHawkesSumExpKernLogLik(self.sumexp_decays).fit(
+            self.realization, self.end_time
+        )
+        sumexp_coeffs = np.hstack((self.baseline, self.sumexp_adjacency.ravel()))
+        np.testing.assert_allclose(
+            sumexp_model.grad(sumexp_coeffs),
+            np.hstack((sumexp_ref[0], sumexp_ref[1].ravel())) / sum(self.sizes),
+            rtol=1e-14,
+            atol=1e-14,
+        )
+
+    def test_least_squares_statistics_match_references_on_edge_cases(self):
+        edge_realization = [
+            np.array([], dtype=float),
+            np.array([0.2, 0.2, 1.0], dtype=float),
+        ]
+        edge_events, edge_sizes = numeric.pack_realization(edge_realization)
+        target_decays = np.array([1.1, 1.7])
+
+        exp_stats = numeric.exp_ls_statistics(edge_events, edge_sizes, 1.5, target_decays, 1)
+        exp_ref = numeric.exp_ls_statistics_reference(edge_events, edge_sizes, 1.5, target_decays, 1)
+        for actual, expected in zip(exp_stats, exp_ref):
+            np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+
+        sum_stats = numeric.sumexp_ls_integral_statistics(
+            edge_events, edge_sizes, 1.5, self.sumexp_decays
+        )
+        sum_ref = numeric.sumexp_ls_integral_statistics_reference(
+            edge_events, edge_sizes, 1.5, self.sumexp_decays
+        )
+        for actual, expected in zip(sum_stats, sum_ref):
+            np.testing.assert_allclose(actual, expected, rtol=1e-14, atol=1e-14)
+
+        np.testing.assert_allclose(
+            numeric.sumexp_ls_event_feature_sums(edge_events, edge_sizes, self.sumexp_decays, 1),
+            numeric.sumexp_ls_event_feature_sums_reference(edge_events, edge_sizes, self.sumexp_decays, 1),
+            rtol=1e-14,
+            atol=1e-14,
+        )
+
+    def test_numba_can_be_disabled_by_environment(self):
+        env = os.environ.copy()
+        env["OUR_HAWKES_DISABLE_NUMBA"] = "1"
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        command = [
+            sys.executable,
+            "-c",
+            "from our_hawkes.hawkes import numeric; "
+            "print(numeric.NUMBA_AVAILABLE); "
+            "assert not numeric.NUMBA_AVAILABLE; "
+            "assert not numeric.is_numba_enabled()",
+        ]
+        completed = subprocess.run(command, env=env, text=True, capture_output=True, check=True)
+        self.assertIn("False", completed.stdout)
+
     @unittest.skipUnless(numeric.NUMBA_AVAILABLE, "Numba is not installed")
     def test_numba_dispatchers_compile_for_equivalence_cases(self):
         numeric.exp_loglik_loss_scan(
@@ -364,9 +602,60 @@ class NumbaNumericEquivalenceTest(unittest.TestCase):
             self.sumexp_adjacency,
             self.sumexp_decays,
         )
+        numeric.exp_loglik_grad_scan(
+            self.events,
+            self.sizes,
+            self.end_time,
+            self.baseline,
+            self.exp_adjacency,
+            self.exp_decays,
+        )
+        numeric.sumexp_loglik_grad_scan(
+            self.events,
+            self.sizes,
+            self.end_time,
+            self.baseline,
+            self.sumexp_adjacency,
+            self.sumexp_decays,
+        )
+        numeric.exp_ls_statistics(self.events, self.sizes, self.end_time, self.exp_decays[0], 0)
+        numeric.exp_intensity_bound(
+            1.4,
+            self.events,
+            self.sizes,
+            self.baseline,
+            self.exp_adjacency,
+            self.exp_decays,
+            include_current=True,
+        )
+        numeric.sumexp_intensity_bound(
+            1.4,
+            self.events,
+            self.sizes,
+            self.baseline,
+            self.sumexp_adjacency,
+            self.sumexp_decays,
+            include_current=True,
+        )
+        out_times = np.empty(4, dtype=float)
+        out_nodes = np.empty(4, dtype=np.int64)
+        numeric.homogeneous_poisson_events(
+            0.0,
+            2.0,
+            np.array([0.5, 1.0]),
+            np.array([[0.1, 0.2], [0.4, 0.8], [0.2, 0.6], [0.9, 0.1]]),
+            out_times,
+            out_nodes,
+        )
 
         self.assertGreaterEqual(len(numeric._exp_loglik_loss_scan_numba.signatures), 1)
         self.assertGreaterEqual(len(numeric._sumexp_loglik_loss_scan_numba.signatures), 1)
+        self.assertGreaterEqual(len(numeric._exp_loglik_grad_scan_numba.signatures), 1)
+        self.assertGreaterEqual(len(numeric._sumexp_loglik_grad_scan_numba.signatures), 1)
+        self.assertGreaterEqual(len(numeric._exp_ls_statistics_numba.signatures), 1)
+        self.assertGreaterEqual(len(numeric._exp_intensity_bound_numba.signatures), 1)
+        self.assertGreaterEqual(len(numeric._sumexp_intensity_bound_numba.signatures), 1)
+        self.assertGreaterEqual(len(numeric._homogeneous_poisson_events_numba.signatures), 1)
 
 
 if __name__ == "__main__":

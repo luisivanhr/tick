@@ -21,7 +21,18 @@ from .kernels import (
     HawkesKernelExp,
     HawkesKernelSumExp,
 )
-from .numeric import exp_kernel_convolution, sumexp_kernel_convolution
+from .numeric import (
+    exp_compensator_value,
+    exp_intensity_bound,
+    exp_intensity_vector,
+    exp_kernel_convolution,
+    homogeneous_poisson_events,
+    pack_realization,
+    sumexp_compensator_value,
+    sumexp_intensity_bound,
+    sumexp_intensity_vector,
+    sumexp_kernel_convolution,
+)
 
 
 class Simu(BaseEstimator):
@@ -342,6 +353,66 @@ class SimuPoissonProcess(SimuPointProcess):
         del include_current_jumps
         return self._intensities.copy()
 
+    def _simulate(self):
+        if self.end_time is None and self.max_jumps is None:
+            raise ValueError("Either end_time or max_jumps must be set")
+        if self.end_time is not None and float(self.end_time) == self.simulation_time:
+            warnings.warn(
+                f"This process has already been simulated until time {float(self.end_time):f}",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        end_time = math.inf if self.end_time is None else float(self.end_time)
+        max_jumps = math.inf if self.max_jumps is None else int(self.max_jumps)
+        if end_time < self._time:
+            raise ValueError(
+                "This point process has already been simulated until time "
+                f"{self._time:f}, you cannot simulate it until {end_time:f}"
+            )
+        if self._time == 0.0 and self.n_total_jumps == 0 and not self._tracked_times:
+            self._record_intensity(0.0)
+
+        total_intensity = float(np.sum(self._intensities))
+        if total_intensity <= 0.0:
+            if math.isfinite(end_time):
+                self._record_regular_intensity_until(end_time)
+                self._time = end_time
+            return self
+
+        chunk_size = 4096
+        while self._time < end_time and self.n_total_jumps < max_jumps:
+            remaining = max_jumps - self.n_total_jumps
+            current_chunk = chunk_size if not math.isfinite(remaining) else min(chunk_size, int(remaining))
+            if current_chunk <= 0:
+                break
+            uniforms = self._rng.random((current_chunk, 2))
+            event_times = np.empty(current_chunk, dtype=float)
+            event_nodes = np.empty(current_chunk, dtype=np.int64)
+            count, stop_time, hit_end = homogeneous_poisson_events(
+                self._time,
+                end_time,
+                self._intensities,
+                uniforms,
+                event_times,
+                event_nodes,
+            )
+            for index in range(count):
+                jump_time = float(event_times[index])
+                self._record_regular_intensity_until(jump_time)
+                self._time = jump_time
+                self._timestamps[int(event_nodes[index])].append(jump_time)
+                self._record_intensity(jump_time, include_current_jumps=True)
+            if hit_end:
+                self._record_regular_intensity_until(stop_time)
+                self._time = stop_time
+                break
+            if count == 0:
+                self._time = stop_time
+                continue
+            self._time = float(event_times[count - 1])
+        return self
+
     def _evaluate_compensator(self, node: int, t: float) -> float:
         return float(self._intensities[node] * t)
 
@@ -654,6 +725,56 @@ class SimuHawkesExpKernels(SimuHawkes):
         self.adjacency = self.adjacency * float(spectral_radius) / original
         self.kernels = self._build_exp_kernels()
 
+    def _decays_matrix(self) -> np.ndarray:
+        if isinstance(self.decays, (int, float)):
+            return np.full_like(self.adjacency, float(self.decays), dtype=float)
+        return np.asarray(self.decays, dtype=float)
+
+    def _intensity_at(self, t: float, include_current_jumps: bool = False) -> np.ndarray:
+        baseline = _constant_numeric_baseline_array(self.baseline)
+        if baseline is None:
+            return super()._intensity_at(t, include_current_jumps=include_current_jumps)
+        events, sizes = pack_realization(self.timestamps)
+        return exp_intensity_vector(
+            t,
+            events,
+            sizes,
+            baseline,
+            self.adjacency,
+            self._decays_matrix(),
+            include_current=include_current_jumps,
+        )
+
+    def _total_intensity_bound(self, t: float, include_current_jumps: bool = True) -> float:
+        baseline = _constant_numeric_baseline_array(self.baseline)
+        if baseline is None:
+            return super()._total_intensity_bound(t, include_current_jumps=include_current_jumps)
+        events, sizes = pack_realization(self.timestamps)
+        return exp_intensity_bound(
+            t,
+            events,
+            sizes,
+            baseline,
+            self.adjacency,
+            self._decays_matrix(),
+            include_current=include_current_jumps,
+        )
+
+    def _evaluate_compensator(self, node: int, t: float) -> float:
+        baseline = _constant_numeric_baseline_array(self.baseline)
+        if baseline is None:
+            return super()._evaluate_compensator(node, t)
+        events, sizes = pack_realization(self.timestamps)
+        return exp_compensator_value(
+            node,
+            t,
+            events,
+            sizes,
+            baseline,
+            self.adjacency,
+            self._decays_matrix(),
+        )
+
 
 class SimuHawkesSumExpKernels(SimuHawkes):
     """Hawkes simulation with sum-exponential kernels."""
@@ -712,6 +833,51 @@ class SimuHawkesSumExpKernels(SimuHawkes):
             raise ValueError("cannot adjust spectral radius of a zero kernel matrix")
         self.adjacency = self.adjacency * float(spectral_radius) / original
         self.kernels = self._build_sumexp_kernels()
+
+    def _intensity_at(self, t: float, include_current_jumps: bool = False) -> np.ndarray:
+        baseline = _constant_numeric_baseline_array(self.baseline)
+        if baseline is None:
+            return super()._intensity_at(t, include_current_jumps=include_current_jumps)
+        events, sizes = pack_realization(self.timestamps)
+        return sumexp_intensity_vector(
+            t,
+            events,
+            sizes,
+            baseline,
+            self.adjacency,
+            self.decays,
+            include_current=include_current_jumps,
+        )
+
+    def _total_intensity_bound(self, t: float, include_current_jumps: bool = True) -> float:
+        baseline = _constant_numeric_baseline_array(self.baseline)
+        if baseline is None:
+            return super()._total_intensity_bound(t, include_current_jumps=include_current_jumps)
+        events, sizes = pack_realization(self.timestamps)
+        return sumexp_intensity_bound(
+            t,
+            events,
+            sizes,
+            baseline,
+            self.adjacency,
+            self.decays,
+            include_current=include_current_jumps,
+        )
+
+    def _evaluate_compensator(self, node: int, t: float) -> float:
+        baseline = _constant_numeric_baseline_array(self.baseline)
+        if baseline is None:
+            return super()._evaluate_compensator(node, t)
+        events, sizes = pack_realization(self.timestamps)
+        return sumexp_compensator_value(
+            node,
+            t,
+            events,
+            sizes,
+            baseline,
+            self.adjacency,
+            self.decays,
+        )
 
 
 class SimuHawkesMulti(Simu):
@@ -846,3 +1012,13 @@ def _contains_time_function(value: Any) -> bool:
     if isinstance(value, (list, tuple, np.ndarray)):
         return any(isinstance(v, TimeFunction) for v in np.asarray(value, dtype=object).flat)
     return False
+
+
+def _constant_numeric_baseline_array(value: Any) -> np.ndarray | None:
+    try:
+        arr = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if arr.ndim != 1:
+        return None
+    return np.ascontiguousarray(arr, dtype=float)

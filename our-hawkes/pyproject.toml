@@ -11,13 +11,15 @@ requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0",
   "scipy>=1.13",
-  "numba>=0.60",
   "matplotlib>=3.8",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
+]
+numba = [
+  "numba>=0.60",
 ]
 torch = [
   "torch",

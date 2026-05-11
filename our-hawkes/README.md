@@ -16,6 +16,34 @@ The implementation intentionally avoids C++ extensions. It uses NumPy/SciPy for
 reference numerical work, optional Numba JIT helpers for hot loops, and Python
 parallelism for repeated simulations.
 
+## Optional Numba Acceleration
+
+Numba is optional. The Python/NumPy formulas remain the source of truth and the
+package imports without Numba installed. Install the extra when you want JIT
+dispatchers:
+
+```powershell
+& "C:\Users\luisi\Documents\Programming\Python\.misc314\Scripts\python.exe" -m pip install -e ".[numba]"
+```
+
+Disable JIT dispatch in a process with:
+
+```powershell
+$env:OUR_HAWKES_DISABLE_NUMBA = "1"
+```
+
+The first call to a JIT-backed helper includes compile latency. Benchmark cold,
+warm, and reference timings separately:
+
+```powershell
+& "C:\Users\luisi\Documents\Programming\Python\.misc314\Scripts\python.exe" benchmarks\benchmark_numba_hot_paths.py
+& "C:\Users\luisi\Documents\Programming\Python\.misc314\Scripts\python.exe" -m unittest discover -s tests -p test_benchmark_smoke.py
+```
+
+Numba cache files (`.nbc` / `.nbi`) may be written near `__pycache__`; on
+Windows, path or permission issues should be handled by disabling Numba rather
+than changing numerical behavior.
+
 ## Current API status
 
 `our_hawkes.hawkes` exports the Hawkes-focused public names from tick's Hawkes
@@ -68,16 +96,19 @@ Use the requested environment:
 
 The current stabilization baseline is:
 
-- `unittest discover -s tests`: 116 tests passing, 1 skipped documented parity
-  case.
+- `unittest discover -s tests`: 135 tests run, OK, with 1 skipped documented
+  parity case.
 - `unittest discover -s tests\tick_equivalence`: 171 local tick Hawkes tests
   inventoried in the equivalence ledger; current classification is 165 pass,
   0 unresolved equivalence gaps, and 6 optional backend cases.
+- Tick-equivalence status: 165 pass, 0 xfail, 6 optional skips.
 - `tests\tick_equivalence\report_equivalence.py`: prints the ledger counts
   by `pass`, `xfail_equivalence_gap`, and `skip_optional_backend`.
 - All scripts in `examples/`: smoke-tested successfully from this checkout.
 - Clean-directory import: verified with `PYTHONPATH` set to the absolute
   `our-hawkes/src` directory.
+- Public export check: every name listed in `our_hawkes.hawkes.__all__` imports
+  from the local source tree.
 
 Install editable dependencies when needed:
 

@@ -20,6 +20,7 @@ from .models import (
     ModelHawkesSumExpKernLeastSq,
     ModelHawkesSumExpKernLogLik,
 )
+from .numeric import NUMBA_AVAILABLE, _compile, pack_realization, pack_realizations
 from .simulation import SimuHawkesExpKernels, SimuHawkesSumExpKernels
 from .solvers import (
     AGD,
@@ -858,6 +859,138 @@ class _HawkesEMPythonBackend:
         )
 
 
+def _hawkes_em_step_reference(events, sizes, end_times, baseline, kernel, discretization):
+    n_realizations, n_nodes, _ = events.shape
+    kernel_size = kernel.shape[2]
+    support = float(discretization[-1])
+    total_time = float(np.sum(end_times))
+    next_baseline = np.zeros(n_nodes, dtype=float)
+    next_kernel = np.zeros_like(kernel)
+    node_counts = np.zeros(n_nodes, dtype=float)
+    dt = np.diff(discretization)
+
+    for r in range(n_realizations):
+        for v in range(n_nodes):
+            node_counts[v] += int(sizes[r, v])
+    node_counts = np.maximum(node_counts, 1.0)
+
+    for r in range(n_realizations):
+        for u in range(n_nodes):
+            for event_index in range(int(sizes[r, u])):
+                t = float(events[r, u, event_index])
+                contributions = np.zeros((n_nodes, kernel_size), dtype=float)
+                intensity = float(baseline[u])
+                for v in range(n_nodes):
+                    for source_index in range(int(sizes[r, v])):
+                        tj = float(events[r, v, source_index])
+                        if tj >= t:
+                            break
+                        lag = float(t - tj)
+                        if lag >= support:
+                            continue
+                        m = int(np.searchsorted(discretization, lag) - 1)
+                        if 0 <= m < kernel_size:
+                            value = float(kernel[u, v, m])
+                            contributions[v, m] += value
+                            intensity += value
+                if intensity <= 0.0:
+                    continue
+                next_baseline[u] += float(baseline[u]) / intensity
+                next_kernel[u] += contributions / intensity
+
+    out_baseline = np.maximum(next_baseline / max(total_time, 1e-15), 0.0)
+    out_kernel = np.empty_like(kernel)
+    for u in range(n_nodes):
+        for v in range(n_nodes):
+            for m in range(kernel_size):
+                out_kernel[u, v, m] = max(next_kernel[u, v, m] / (node_counts[v] * dt[m]), 0.0)
+    return out_baseline, out_kernel
+
+
+def _hawkes_em_step_numba_impl(events, sizes, end_times, baseline, kernel, discretization, out_baseline, out_kernel):
+    n_realizations, n_nodes, _ = events.shape
+    kernel_size = kernel.shape[2]
+    support = discretization[discretization.size - 1]
+    total_time = 0.0
+    for r in range(n_realizations):
+        total_time += end_times[r]
+
+    node_counts = np.zeros(n_nodes, dtype=np.float64)
+    next_baseline = np.zeros(n_nodes, dtype=np.float64)
+    next_kernel = np.zeros((n_nodes, n_nodes, kernel_size), dtype=np.float64)
+
+    for r in range(n_realizations):
+        for v in range(n_nodes):
+            node_counts[v] += sizes[r, v]
+    for v in range(n_nodes):
+        if node_counts[v] < 1.0:
+            node_counts[v] = 1.0
+
+    for r in range(n_realizations):
+        for u in range(n_nodes):
+            for event_index in range(sizes[r, u]):
+                t = events[r, u, event_index]
+                intensity = baseline[u]
+                contributions = np.zeros((n_nodes, kernel_size), dtype=np.float64)
+                for v in range(n_nodes):
+                    for source_index in range(sizes[r, v]):
+                        tj = events[r, v, source_index]
+                        if tj >= t:
+                            break
+                        lag = t - tj
+                        if lag >= support:
+                            continue
+                        m = -1
+                        for boundary in range(discretization.size):
+                            if discretization[boundary] > lag:
+                                m = boundary - 1
+                                break
+                        if m == -1:
+                            m = discretization.size - 1
+                        if 0 <= m < kernel_size:
+                            value = kernel[u, v, m]
+                            contributions[v, m] += value
+                            intensity += value
+                if intensity <= 0.0:
+                    continue
+                next_baseline[u] += baseline[u] / intensity
+                for v in range(n_nodes):
+                    for m in range(kernel_size):
+                        next_kernel[u, v, m] += contributions[v, m] / intensity
+
+    denom_time = total_time
+    if denom_time < 1e-15:
+        denom_time = 1e-15
+    for u in range(n_nodes):
+        value = next_baseline[u] / denom_time
+        out_baseline[u] = value if value > 0.0 else 0.0
+
+    for u in range(n_nodes):
+        for v in range(n_nodes):
+            for m in range(kernel_size):
+                dt = discretization[m + 1] - discretization[m]
+                value = next_kernel[u, v, m] / (node_counts[v] * dt)
+                out_kernel[u, v, m] = value if value > 0.0 else 0.0
+
+
+_hawkes_em_step_numba = _compile(_hawkes_em_step_numba_impl)
+
+
+def _hawkes_em_step(events, sizes, end_times, baseline, kernel, discretization):
+    events = np.ascontiguousarray(np.asarray(events, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    end_times = np.ascontiguousarray(np.asarray(end_times, dtype=float))
+    baseline = np.ascontiguousarray(np.asarray(baseline, dtype=float))
+    kernel = np.ascontiguousarray(np.asarray(kernel, dtype=float))
+    discretization = np.ascontiguousarray(np.asarray(discretization, dtype=float))
+    if NUMBA_AVAILABLE:
+        out_baseline = np.empty_like(baseline)
+        out_kernel = np.empty_like(kernel)
+        _hawkes_em_step_numba(events, sizes, end_times, baseline, kernel, discretization, out_baseline, out_kernel)
+        return out_baseline, out_kernel
+    return _hawkes_em_step_reference(events, sizes, end_times, baseline, kernel, discretization)
+
+
 class HawkesEM(_LearnerBase):
     """Non-parametric EM learner with piecewise constant kernels."""
 
@@ -981,42 +1114,15 @@ class HawkesEM(_LearnerBase):
         return self
 
     def _em_step(self):
-        total_time = float(np.sum(self._end_times))
-        next_baseline = np.zeros(self.n_nodes, dtype=float)
-        next_kernel = np.zeros_like(self.kernel)
-        node_counts = np.zeros(self.n_nodes, dtype=float)
-        dt = np.diff(self._kernel_discretization)
-        for realization in self.data:
-            for v in range(self.n_nodes):
-                node_counts[v] += realization[v].size
-        node_counts = np.maximum(node_counts, 1.0)
-
-        for realization in self.data:
-            for u in range(self.n_nodes):
-                for t in realization[u]:
-                    contributions = np.zeros((self.n_nodes, self.kernel_size), dtype=float)
-                    intensity = self.baseline[u]
-                    for v in range(self.n_nodes):
-                        for tj in realization[v]:
-                            if tj >= t:
-                                break
-                            lag = float(t - tj)
-                            if lag >= self.kernel_support:
-                                continue
-                            m = int(np.searchsorted(self._kernel_discretization, lag) - 1)
-                            if 0 <= m < self.kernel_size:
-                                value = self.kernel[u, v, m]
-                                contributions[v, m] += value
-                                intensity += value
-                    if intensity <= 0:
-                        continue
-                    next_baseline[u] += self.baseline[u] / intensity
-                    next_kernel[u] += contributions / intensity
-
-        self.baseline = np.maximum(next_baseline / max(total_time, 1e-15), 0.0)
-        for u, v, m in product(range(self.n_nodes), range(self.n_nodes), range(self.kernel_size)):
-            self.kernel[u, v, m] = next_kernel[u, v, m] / (node_counts[v] * dt[m])
-        self.kernel = np.maximum(self.kernel, 0.0)
+        events, sizes, end_times = pack_realizations(self.data, self._end_times)
+        self.baseline, self.kernel = _hawkes_em_step(
+            events,
+            sizes,
+            end_times,
+            self.baseline,
+            self.kernel,
+            self._kernel_discretization,
+        )
 
     @property
     def _flat_kernels(self):
@@ -1122,6 +1228,201 @@ class HawkesEM(_LearnerBase):
         }
 
 
+def _adm4_compute_weights_reference(events, sizes, end_times, decay):
+    n_realizations, n_nodes, max_events = events.shape
+    g = np.zeros((n_realizations, n_nodes, max_events, n_nodes), dtype=float)
+    map_kernel_integral = np.zeros((n_realizations, n_nodes), dtype=float)
+
+    for r in range(n_realizations):
+        end_time = float(end_times[r])
+        for u in range(n_nodes):
+            for v in range(n_nodes):
+                ij = 0
+                for k in range(int(sizes[r, u])):
+                    t_u_k = float(events[r, u, k])
+                    if k > 0:
+                        previous_t = float(events[r, u, k - 1])
+                        g[r, u, k, v] = g[r, u, k - 1, v] * math.exp(-float(decay) * (t_u_k - previous_t))
+                    while ij < int(sizes[r, v]) and float(events[r, v, ij]) < t_u_k:
+                        g[r, u, k, v] += float(decay) * math.exp(
+                            -float(decay) * (t_u_k - float(events[r, v, ij]))
+                        )
+                        ij += 1
+                    if u == v:
+                        map_kernel_integral[r, u] += 1.0 - math.exp(-float(decay) * (end_time - t_u_k))
+    return g, map_kernel_integral
+
+
+def _adm4_em_update_reference(
+    g,
+    sizes,
+    end_times,
+    kernel_integral,
+    rho,
+    mu,
+    adjacency,
+    z1,
+    z2,
+    u1,
+    u2,
+):
+    n_realizations, n_nodes, _, _ = g.shape
+    next_mu = np.zeros((n_realizations, n_nodes), dtype=float)
+    next_C = np.zeros((n_realizations * n_nodes, n_nodes), dtype=float)
+
+    for r in range(n_realizations):
+        for node_u in range(n_nodes):
+            mu_u = float(mu[node_u])
+            adjacency_u = adjacency[node_u]
+            next_C_ru = next_C[r * n_nodes + node_u]
+            for i in range(int(sizes[r, node_u]) - 1, -1, -1):
+                norm = mu_u
+                for v in range(n_nodes):
+                    norm += float(adjacency_u[v]) * float(g[r, node_u, i, v])
+                if norm <= 0.0:
+                    continue
+                next_mu[r, node_u] += mu_u / norm
+                for v in range(n_nodes):
+                    next_C_ru[v] += float(adjacency_u[v]) * float(g[r, node_u, i, v]) / norm
+
+    end_times_sum = float(np.sum(end_times))
+    for u in range(n_nodes):
+        for v in range(n_nodes):
+            b_value = float(kernel_integral[v]) + float(rho) * (
+                -float(z1[u, v]) + float(u1[u, v]) - float(z2[u, v]) + float(u2[u, v])
+            )
+            c_value = 0.0
+            for r in range(n_realizations):
+                c_value += float(next_C[r * n_nodes + u, v])
+            adjacency[u, v] = (-b_value + math.sqrt(b_value * b_value + 8.0 * float(rho) * c_value)) / (
+                4.0 * float(rho)
+            )
+        mu[u] = float(np.sum(next_mu[:, u]) / end_times_sum)
+    return next_mu, next_C
+
+
+def _adm4_compute_weights_numba_impl(events, sizes, end_times, decay, g, map_kernel_integral):
+    n_realizations, n_nodes, max_events = events.shape
+    for r in range(n_realizations):
+        for u in range(n_nodes):
+            map_kernel_integral[r, u] = 0.0
+            for k in range(max_events):
+                for v in range(n_nodes):
+                    g[r, u, k, v] = 0.0
+
+    for r in range(n_realizations):
+        end_time = end_times[r]
+        for u in range(n_nodes):
+            for v in range(n_nodes):
+                ij = 0
+                for k in range(sizes[r, u]):
+                    t_u_k = events[r, u, k]
+                    if k > 0:
+                        previous_t = events[r, u, k - 1]
+                        g[r, u, k, v] = g[r, u, k - 1, v] * math.exp(-decay * (t_u_k - previous_t))
+                    while ij < sizes[r, v] and events[r, v, ij] < t_u_k:
+                        g[r, u, k, v] += decay * math.exp(-decay * (t_u_k - events[r, v, ij]))
+                        ij += 1
+                    if u == v:
+                        map_kernel_integral[r, u] += 1.0 - math.exp(-decay * (end_time - t_u_k))
+
+
+def _adm4_em_update_numba_impl(
+    g,
+    sizes,
+    end_times,
+    kernel_integral,
+    rho,
+    mu,
+    adjacency,
+    z1,
+    z2,
+    u1,
+    u2,
+    next_mu,
+    next_C,
+):
+    n_realizations, n_nodes, _, _ = g.shape
+    for r in range(n_realizations):
+        for u in range(n_nodes):
+            next_mu[r, u] = 0.0
+    for row in range(n_realizations * n_nodes):
+        for v in range(n_nodes):
+            next_C[row, v] = 0.0
+
+    for r in range(n_realizations):
+        for node_u in range(n_nodes):
+            mu_u = mu[node_u]
+            for i in range(sizes[r, node_u] - 1, -1, -1):
+                norm = mu_u
+                for v in range(n_nodes):
+                    norm += adjacency[node_u, v] * g[r, node_u, i, v]
+                if norm <= 0.0:
+                    continue
+                next_mu[r, node_u] += mu_u / norm
+                row = r * n_nodes + node_u
+                for v in range(n_nodes):
+                    next_C[row, v] += adjacency[node_u, v] * g[r, node_u, i, v] / norm
+
+    end_times_sum = 0.0
+    for r in range(n_realizations):
+        end_times_sum += end_times[r]
+    for u in range(n_nodes):
+        for v in range(n_nodes):
+            b_value = kernel_integral[v] + rho * (-z1[u, v] + u1[u, v] - z2[u, v] + u2[u, v])
+            c_value = 0.0
+            for r in range(n_realizations):
+                c_value += next_C[r * n_nodes + u, v]
+            adjacency[u, v] = (-b_value + math.sqrt(b_value * b_value + 8.0 * rho * c_value)) / (4.0 * rho)
+        mu_sum = 0.0
+        for r in range(n_realizations):
+            mu_sum += next_mu[r, u]
+        mu[u] = mu_sum / end_times_sum
+
+
+_adm4_compute_weights_numba = _compile(_adm4_compute_weights_numba_impl)
+_adm4_em_update_numba = _compile(_adm4_em_update_numba_impl)
+
+
+def _adm4_compute_weights(events, sizes, end_times, decay):
+    events = np.ascontiguousarray(np.asarray(events, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    end_times = np.ascontiguousarray(np.asarray(end_times, dtype=float))
+    if NUMBA_AVAILABLE:
+        g = np.empty((events.shape[0], events.shape[1], events.shape[2], events.shape[1]), dtype=float)
+        map_kernel_integral = np.empty((events.shape[0], events.shape[1]), dtype=float)
+        _adm4_compute_weights_numba(events, sizes, end_times, float(decay), g, map_kernel_integral)
+        return g, map_kernel_integral
+    return _adm4_compute_weights_reference(events, sizes, end_times, float(decay))
+
+
+def _adm4_em_update(g, sizes, end_times, kernel_integral, rho, mu, adjacency, z1, z2, u1, u2):
+    g = np.ascontiguousarray(np.asarray(g, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    end_times = np.ascontiguousarray(np.asarray(end_times, dtype=float))
+    kernel_integral = np.ascontiguousarray(np.asarray(kernel_integral, dtype=float))
+    if NUMBA_AVAILABLE:
+        next_mu = np.zeros((g.shape[0], g.shape[1]), dtype=float)
+        next_C = np.zeros((g.shape[0] * g.shape[1], g.shape[1]), dtype=float)
+        _adm4_em_update_numba(
+            g,
+            sizes,
+            end_times,
+            kernel_integral,
+            float(rho),
+            mu,
+            adjacency,
+            z1,
+            z2,
+            u1,
+            u2,
+            next_mu,
+            next_C,
+        )
+        return next_mu, next_C
+    return _adm4_em_update_reference(g, sizes, end_times, kernel_integral, rho, mu, adjacency, z1, z2, u1, u2)
+
+
 class _ADM4PythonBackend:
     """NumPy port of tick's private C++ HawkesADM4 update backend."""
 
@@ -1132,6 +1433,9 @@ class _ADM4PythonBackend:
         self.approx = approx
         self.data = None
         self.end_times = None
+        self._events_packed = None
+        self._event_sizes = None
+        self._g_packed = None
         self.n_nodes = 0
         self.n_realizations = 0
         self.weights_computed = False
@@ -1147,6 +1451,9 @@ class _ADM4PythonBackend:
         self.end_times = np.asarray(end_times, dtype=float)
         self.n_nodes = int(n_nodes)
         self.n_realizations = len(data)
+        self._events_packed = None
+        self._event_sizes = None
+        self._g_packed = None
         self.weights_computed = False
 
     def get_decay(self):
@@ -1171,33 +1478,21 @@ class _ADM4PythonBackend:
     def compute_weights(self):
         if self.data is None or self.end_times is None:
             raise ValueError("data must be set before computing ADM4 weights")
+        events, sizes, _ = pack_realizations(self.data, self.end_times)
+        self._events_packed = events
+        self._event_sizes = sizes
         self.next_mu = np.zeros((self.n_realizations, self.n_nodes), dtype=float)
         self.next_C = np.zeros((self.n_realizations * self.n_nodes, self.n_nodes), dtype=float)
-        map_kernel_integral = np.zeros((self.n_realizations, self.n_nodes), dtype=float)
-        self.g = []
-
-        for r, realization in enumerate(self.data):
-            realization_g = []
-            end_time = float(self.end_times[r])
-            for u in range(self.n_nodes):
-                timestamps_u = realization[u]
-                g_ru = np.zeros((timestamps_u.size, self.n_nodes), dtype=float)
-                for v in range(self.n_nodes):
-                    timestamps_v = realization[v]
-                    ij = 0
-                    for k, t_u_k in enumerate(timestamps_u):
-                        t_u_k = float(t_u_k)
-                        if k > 0:
-                            previous_t = float(timestamps_u[k - 1])
-                            g_ru[k, v] = g_ru[k - 1, v] * math.exp(-self.decay * (t_u_k - previous_t))
-                        while ij < timestamps_v.size and timestamps_v[ij] < t_u_k:
-                            g_ru[k, v] += self.decay * math.exp(-self.decay * (t_u_k - float(timestamps_v[ij])))
-                            ij += 1
-                        if u == v:
-                            map_kernel_integral[r, u] += 1.0 - math.exp(-self.decay * (end_time - t_u_k))
-                realization_g.append(g_ru)
-            self.g.append(realization_g)
-
+        self._g_packed, map_kernel_integral = _adm4_compute_weights(
+            events,
+            sizes,
+            self.end_times,
+            self.decay,
+        )
+        self.g = [
+            [self._g_packed[r, u, : int(sizes[r, u]), :].copy() for u in range(self.n_nodes)]
+            for r in range(self.n_realizations)
+        ]
         self.kernel_integral = np.sum(map_kernel_integral, axis=0)
         self.weights_computed = True
 
@@ -1208,36 +1503,19 @@ class _ADM4PythonBackend:
         adjacency = np.asarray(adjacency, dtype=float)
         self._check_shapes(mu, adjacency, z1, z2, u1, u2)
 
-        self.next_mu.fill(0.0)
-        self.next_C.fill(0.0)
-        for r in range(self.n_realizations):
-            realization = self.data[r]
-            for node_u in range(self.n_nodes):
-                timestamps_u = realization[node_u]
-                g_ru = self.g[r][node_u]
-                mu_u = float(mu[node_u])
-                adjacency_u = adjacency[node_u]
-                next_C_ru = self.next_C[r * self.n_nodes + node_u]
-                for i in range(timestamps_u.size - 1, -1, -1):
-                    g_i = g_ru[i]
-                    unnormalized = adjacency_u * g_i
-                    norm = mu_u + float(np.sum(unnormalized))
-                    if norm <= 0.0:
-                        continue
-                    self.next_mu[r, node_u] += mu_u / norm
-                    next_C_ru += unnormalized / norm
-
-        end_times_sum = float(np.sum(self.end_times))
-        for u in range(self.n_nodes):
-            for v in range(self.n_nodes):
-                b_value = self.kernel_integral[v] + self.rho * (
-                    -z1[u, v] + u1[u, v] - z2[u, v] + u2[u, v]
-                )
-                c_value = float(np.sum(self.next_C[u :: self.n_nodes, v]))
-                adjacency[u, v] = (-b_value + math.sqrt(b_value * b_value + 8.0 * self.rho * c_value)) / (
-                    4.0 * self.rho
-                )
-            mu[u] = float(np.sum(self.next_mu[:, u]) / end_times_sum)
+        self.next_mu, self.next_C = _adm4_em_update(
+            self._g_packed,
+            self._event_sizes,
+            self.end_times,
+            self.kernel_integral,
+            self.rho,
+            mu,
+            adjacency,
+            z1,
+            z2,
+            u1,
+            u2,
+        )
 
     def _check_shapes(self, mu, adjacency, z1, z2, u1, u2):
         if mu.shape != (self.n_nodes,):
@@ -1566,6 +1844,268 @@ def _soft_threshold_scalar(z, alpha):
     return max(abs(float(z)) - float(alpha), 0.0) if z > 0 else -max(abs(float(z)) - float(alpha), 0.0)
 
 
+def _sumgaussians_compute_weights_reference(events, sizes, end_times, means, std):
+    n_realizations, n_nodes, max_events = events.shape
+    n_gaussians = means.size
+    std_sq = std * std
+    norm_constant_gauss = std * math.sqrt(2.0 * math.pi)
+    norm_constant_erf = std * math.sqrt(2.0)
+    g = np.zeros((n_realizations, n_nodes, max_events, n_nodes * n_gaussians), dtype=float)
+    map_kernel_integral = np.zeros((n_realizations, n_nodes * n_gaussians), dtype=float)
+
+    for r in range(n_realizations):
+        end_time = float(end_times[r])
+        for u in range(n_nodes):
+            for k in range(int(sizes[r, u])):
+                t_u_k = float(events[r, u, k])
+                for v in range(n_nodes):
+                    for m in range(n_gaussians):
+                        ij = 0
+                        total = 0.0
+                        while ij < int(sizes[r, v]) and float(events[r, v, ij]) < t_u_k:
+                            lag = t_u_k - float(events[r, v, ij]) - float(means[m])
+                            total += math.exp(-(lag * lag) / (2.0 * std_sq)) / norm_constant_gauss
+                            ij += 1
+                        g[r, u, k, v * n_gaussians + m] = total
+                    if u == v:
+                        for m in range(n_gaussians):
+                            map_kernel_integral[r, u * n_gaussians + m] += (
+                                0.5 * math.erf((end_time - t_u_k - float(means[m])) / norm_constant_erf)
+                                + 0.5 * math.erf(float(means[m]) / norm_constant_erf)
+                            )
+    return g, map_kernel_integral
+
+
+def _sumgaussians_em_inner_loop_reference(
+    g,
+    sizes,
+    end_times,
+    kernel_integral,
+    strength_lasso,
+    strength_grouplasso,
+    em_max_iter,
+    mu,
+    amplitudes,
+):
+    n_realizations, n_nodes, _, n_features = g.shape
+    n_gaussians = n_features // n_nodes
+    next_mu = np.zeros((n_realizations, n_nodes), dtype=float)
+    next_C = np.zeros((n_realizations * n_nodes, n_features), dtype=float)
+    end_times_sum = float(np.sum(end_times))
+
+    for _ in range(int(em_max_iter)):
+        next_mu.fill(0.0)
+        next_C.fill(0.0)
+        for r in range(n_realizations):
+            for u in range(n_nodes):
+                mu_u = float(mu[u])
+                amplitudes_u = amplitudes[u]
+                next_C_ru = next_C[r * n_nodes + u]
+                for i in range(int(sizes[r, u]) - 1, -1, -1):
+                    norm = mu_u
+                    for idx in range(n_features):
+                        norm += float(amplitudes_u[idx]) * float(g[r, u, i, idx])
+                    if norm <= 0.0:
+                        continue
+                    next_mu[r, u] += mu_u / norm
+                    for idx in range(n_features):
+                        next_C_ru[idx] += float(amplitudes_u[idx]) * float(g[r, u, i, idx]) / norm
+
+        for u in range(n_nodes):
+            amplitudes_u = amplitudes[u]
+            for v in range(n_nodes):
+                norm_group = 0.0
+                for m in range(n_gaussians):
+                    value = float(amplitudes_u[v * n_gaussians + m])
+                    norm_group += value * value
+                norm_group = math.sqrt(norm_group)
+                a_value = float(strength_grouplasso) / norm_group if norm_group != 0.0 else 0.0
+                for m in range(n_gaussians):
+                    idx = v * n_gaussians + m
+                    b_value = float(kernel_integral[idx]) + float(strength_lasso)
+                    next_c_sum = 0.0
+                    for r in range(n_realizations):
+                        next_c_sum += float(next_C[r * n_nodes + u, idx])
+                    c_value = -next_c_sum
+                    if a_value != 0.0:
+                        sol = (-b_value + math.sqrt(b_value * b_value - 4.0 * a_value * c_value)) / (
+                            2.0 * a_value
+                        )
+                    else:
+                        sol = -c_value / b_value
+                    amplitudes_u[idx] = sol
+            mu[u] = float(np.sum(next_mu[:, u]) / end_times_sum)
+    return next_mu, next_C
+
+
+def _sumgaussians_compute_weights_numba_impl(events, sizes, end_times, means, std, g, map_kernel_integral):
+    n_realizations, n_nodes, max_events = events.shape
+    n_gaussians = means.size
+    std_sq = std * std
+    norm_constant_gauss = std * math.sqrt(2.0 * math.pi)
+    norm_constant_erf = std * math.sqrt(2.0)
+
+    for r in range(n_realizations):
+        for idx in range(n_nodes * n_gaussians):
+            map_kernel_integral[r, idx] = 0.0
+        for u in range(n_nodes):
+            for k in range(max_events):
+                for idx in range(n_nodes * n_gaussians):
+                    g[r, u, k, idx] = 0.0
+
+    for r in range(n_realizations):
+        end_time = end_times[r]
+        for u in range(n_nodes):
+            for k in range(sizes[r, u]):
+                t_u_k = events[r, u, k]
+                for v in range(n_nodes):
+                    for m in range(n_gaussians):
+                        ij = 0
+                        total = 0.0
+                        while ij < sizes[r, v] and events[r, v, ij] < t_u_k:
+                            lag = t_u_k - events[r, v, ij] - means[m]
+                            total += math.exp(-(lag * lag) / (2.0 * std_sq)) / norm_constant_gauss
+                            ij += 1
+                        g[r, u, k, v * n_gaussians + m] = total
+                    if u == v:
+                        for m in range(n_gaussians):
+                            map_kernel_integral[r, u * n_gaussians + m] += (
+                                0.5 * math.erf((end_time - t_u_k - means[m]) / norm_constant_erf)
+                                + 0.5 * math.erf(means[m] / norm_constant_erf)
+                            )
+
+
+def _sumgaussians_em_inner_loop_numba_impl(
+    g,
+    sizes,
+    end_times,
+    kernel_integral,
+    strength_lasso,
+    strength_grouplasso,
+    em_max_iter,
+    mu,
+    amplitudes,
+    next_mu,
+    next_C,
+):
+    n_realizations, n_nodes, _, n_features = g.shape
+    n_gaussians = n_features // n_nodes
+    end_times_sum = 0.0
+    for r in range(n_realizations):
+        end_times_sum += end_times[r]
+
+    for _ in range(em_max_iter):
+        for r in range(n_realizations):
+            for u in range(n_nodes):
+                next_mu[r, u] = 0.0
+        for row in range(n_realizations * n_nodes):
+            for idx in range(n_features):
+                next_C[row, idx] = 0.0
+
+        for r in range(n_realizations):
+            for u in range(n_nodes):
+                mu_u = mu[u]
+                for i in range(sizes[r, u] - 1, -1, -1):
+                    norm = mu_u
+                    for idx in range(n_features):
+                        norm += amplitudes[u, idx] * g[r, u, i, idx]
+                    if norm <= 0.0:
+                        continue
+                    next_mu[r, u] += mu_u / norm
+                    row = r * n_nodes + u
+                    for idx in range(n_features):
+                        next_C[row, idx] += amplitudes[u, idx] * g[r, u, i, idx] / norm
+
+        for u in range(n_nodes):
+            for v in range(n_nodes):
+                norm_group = 0.0
+                for m in range(n_gaussians):
+                    value = amplitudes[u, v * n_gaussians + m]
+                    norm_group += value * value
+                norm_group = math.sqrt(norm_group)
+                a_value = strength_grouplasso / norm_group if norm_group != 0.0 else 0.0
+                for m in range(n_gaussians):
+                    idx = v * n_gaussians + m
+                    b_value = kernel_integral[idx] + strength_lasso
+                    next_c_sum = 0.0
+                    for r in range(n_realizations):
+                        next_c_sum += next_C[r * n_nodes + u, idx]
+                    c_value = -next_c_sum
+                    if a_value != 0.0:
+                        sol = (-b_value + math.sqrt(b_value * b_value - 4.0 * a_value * c_value)) / (
+                            2.0 * a_value
+                        )
+                    else:
+                        sol = -c_value / b_value
+                    amplitudes[u, idx] = sol
+            mu_sum = 0.0
+            for r in range(n_realizations):
+                mu_sum += next_mu[r, u]
+            mu[u] = mu_sum / end_times_sum
+
+
+_sumgaussians_compute_weights_numba = _compile(_sumgaussians_compute_weights_numba_impl)
+_sumgaussians_em_inner_loop_numba = _compile(_sumgaussians_em_inner_loop_numba_impl)
+
+
+def _sumgaussians_compute_weights(events, sizes, end_times, means, std):
+    events = np.ascontiguousarray(np.asarray(events, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    end_times = np.ascontiguousarray(np.asarray(end_times, dtype=float))
+    means = np.ascontiguousarray(np.asarray(means, dtype=float))
+    if NUMBA_AVAILABLE:
+        g = np.empty((events.shape[0], events.shape[1], events.shape[2], events.shape[1] * means.size), dtype=float)
+        map_kernel_integral = np.empty((events.shape[0], events.shape[1] * means.size), dtype=float)
+        _sumgaussians_compute_weights_numba(events, sizes, end_times, means, float(std), g, map_kernel_integral)
+        return g, map_kernel_integral
+    return _sumgaussians_compute_weights_reference(events, sizes, end_times, means, float(std))
+
+
+def _sumgaussians_em_inner_loop(
+    g,
+    sizes,
+    end_times,
+    kernel_integral,
+    strength_lasso,
+    strength_grouplasso,
+    em_max_iter,
+    mu,
+    amplitudes,
+):
+    g = np.ascontiguousarray(np.asarray(g, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    end_times = np.ascontiguousarray(np.asarray(end_times, dtype=float))
+    kernel_integral = np.ascontiguousarray(np.asarray(kernel_integral, dtype=float))
+    if NUMBA_AVAILABLE:
+        next_mu = np.zeros((g.shape[0], g.shape[1]), dtype=float)
+        next_C = np.zeros((g.shape[0] * g.shape[1], g.shape[3]), dtype=float)
+        _sumgaussians_em_inner_loop_numba(
+            g,
+            sizes,
+            end_times,
+            kernel_integral,
+            float(strength_lasso),
+            float(strength_grouplasso),
+            int(em_max_iter),
+            mu,
+            amplitudes,
+            next_mu,
+            next_C,
+        )
+        return next_mu, next_C
+    return _sumgaussians_em_inner_loop_reference(
+        g,
+        sizes,
+        end_times,
+        kernel_integral,
+        strength_lasso,
+        strength_grouplasso,
+        em_max_iter,
+        mu,
+        amplitudes,
+    )
+
+
 class _SumGaussiansPythonBackend:
     """NumPy port of tick's private C++ HawkesSumGaussians backend."""
 
@@ -1584,6 +2124,9 @@ class _SumGaussiansPythonBackend:
         self.approx = approx
         self.data = None
         self.end_times = None
+        self._events_packed = None
+        self._event_sizes = None
+        self._g_packed = None
         self.n_nodes = 0
         self.n_realizations = 0
         self.weights_computed = False
@@ -1599,6 +2142,9 @@ class _SumGaussiansPythonBackend:
         self.end_times = np.asarray(end_times, dtype=float)
         self.n_nodes = int(n_nodes)
         self.n_realizations = len(data)
+        self._events_packed = None
+        self._event_sizes = None
+        self._g_packed = None
         self.weights_computed = False
 
     def get_n_gaussians(self):
@@ -1668,46 +2214,24 @@ class _SumGaussiansPythonBackend:
     def compute_weights(self):
         if self.data is None or self.end_times is None:
             raise ValueError("data must be set before computing Gaussian weights")
+        events, sizes, _ = pack_realizations(self.data, self.end_times)
+        self._events_packed = events
+        self._event_sizes = sizes
         m_count = self.n_gaussians
-        means = self.means_gaussians
-        std = self.std_gaussian
-        std_sq = std * std
-        norm_constant_gauss = std * math.sqrt(2.0 * math.pi)
-        norm_constant_erf = std * math.sqrt(2.0)
-
         self.next_mu = np.zeros((self.n_realizations, self.n_nodes), dtype=float)
         self.next_C = np.zeros((self.n_realizations * self.n_nodes, self.n_nodes * m_count), dtype=float)
         self.unnormalized_next_C = np.zeros_like(self.next_C)
-        self.g = []
-        map_kernel_integral = np.zeros((self.n_realizations, self.n_nodes * m_count), dtype=float)
-
-        for r, realization in enumerate(self.data):
-            realization_g = []
-            end_time = float(self.end_times[r])
-            for u in range(self.n_nodes):
-                timestamps_u = realization[u]
-                g_ru = np.zeros((timestamps_u.size, self.n_nodes * m_count), dtype=float)
-                for v in range(self.n_nodes):
-                    timestamps_v = realization[v]
-                    for k, t_u_k in enumerate(timestamps_u):
-                        t_u_k = float(t_u_k)
-                        for m in range(m_count):
-                            ij = 0
-                            total = 0.0
-                            while ij < timestamps_v.size and timestamps_v[ij] < t_u_k:
-                                lag = t_u_k - float(timestamps_v[ij]) - means[m]
-                                total += math.exp(-(lag * lag) / (2.0 * std_sq)) / norm_constant_gauss
-                                ij += 1
-                            g_ru[k, v * m_count + m] = total
-                        if u == v:
-                            for m in range(m_count):
-                                map_kernel_integral[r, u * m_count + m] += (
-                                    0.5 * math.erf((end_time - t_u_k - means[m]) / norm_constant_erf)
-                                    + 0.5 * math.erf(means[m] / norm_constant_erf)
-                                )
-                realization_g.append(g_ru)
-            self.g.append(realization_g)
-
+        self._g_packed, map_kernel_integral = _sumgaussians_compute_weights(
+            events,
+            sizes,
+            self.end_times,
+            self.means_gaussians,
+            self.std_gaussian,
+        )
+        self.g = [
+            [self._g_packed[r, u, : int(sizes[r, u]), :].copy() for u in range(self.n_nodes)]
+            for r in range(self.n_realizations)
+        ]
         self.kernel_integral = np.sum(map_kernel_integral, axis=0)
         self.weights_computed = True
 
@@ -1724,11 +2248,25 @@ class _SumGaussiansPythonBackend:
             )
 
         amplitudes_old = amplitudes.copy()
-        for _ in range(self.em_max_iter):
-            self.next_C.fill(0.0)
-            self.next_mu.fill(0.0)
-            self._estimate_all(mu, amplitudes)
-            self._update_all(mu, amplitudes)
+        if NUMBA_AVAILABLE and self._g_packed is not None and self._event_sizes is not None:
+            self.next_mu, self.next_C = _sumgaussians_em_inner_loop(
+                self._g_packed,
+                self._event_sizes,
+                self.end_times,
+                self.kernel_integral,
+                self.strength_lasso,
+                self.strength_grouplasso,
+                self.em_max_iter,
+                mu,
+                amplitudes,
+            )
+            self.unnormalized_next_C = np.zeros_like(self.next_C)
+        else:
+            for _ in range(self.em_max_iter):
+                self.next_C.fill(0.0)
+                self.next_mu.fill(0.0)
+                self._estimate_all(mu, amplitudes)
+                self._update_all(mu, amplitudes)
         self._prox_all(amplitudes, amplitudes_old)
 
     def _estimate_all(self, mu, amplitudes):
@@ -2018,7 +2556,7 @@ class HawkesSumGaussians(_LearnerBase):
         return -_piecewise_loglik(self.data, self._end_times, self.baseline, kernel, discretization)
 
 
-def _basis_compute_r(u_realization, end_time, kernel_dt, basis_kernels, basis_primitives, out):
+def _basis_compute_r_reference(u_realization, end_time, kernel_dt, basis_kernels, basis_primitives, out):
     n_basis, kernel_size = basis_kernels.shape
     for timestamp in u_realization:
         m0 = int(math.floor((float(end_time) - float(timestamp)) / kernel_dt))
@@ -2036,7 +2574,7 @@ def _basis_compute_r(u_realization, end_time, kernel_dt, basis_kernels, basis_pr
                 out[d] += (float(end_time) - float(timestamp) - m0 * kernel_dt) * basis_kernels[d, m0]
 
 
-def _basis_compute_C(u_realization, end_time, kernel_dt, basis_kernels, amplitude_sums, out):
+def _basis_compute_C_reference(u_realization, end_time, kernel_dt, basis_kernels, amplitude_sums, out):
     if u_realization.size == 0:
         return
     n_basis, kernel_size = basis_kernels.shape
@@ -2052,7 +2590,7 @@ def _basis_compute_C(u_realization, end_time, kernel_dt, basis_kernels, amplitud
                 out[d, m] += amplitude_sums[d] * (i + 1) / basis_kernels[d, m]
 
 
-def _basis_compute_mu_q_D(
+def _basis_compute_mu_q_D_reference(
     u_index,
     realization,
     kernel_dt,
@@ -2111,7 +2649,7 @@ def _basis_compute_mu_q_D(
     return mu_out
 
 
-def _basis_compute_gdm(alpha, kernel_dt, basis_kernel, Cdm, Ddm, tol, max_iter):
+def _basis_compute_gdm_reference(alpha, kernel_dt, basis_kernel, Cdm, Ddm, tol, max_iter):
     basis_kernel.fill(0.0)
     max_rel_error = 0.0
     kernel_size = basis_kernel.size
@@ -2134,6 +2672,212 @@ def _basis_compute_gdm(alpha, kernel_dt, basis_kernel, Cdm, Ddm, tol, max_iter):
             break
 
     return max_rel_error
+
+
+def _basis_compute_r_numba_impl(u_realization, end_time, kernel_dt, basis_kernels, basis_primitives, out):
+    n_basis, kernel_size = basis_kernels.shape
+    for k in range(u_realization.size):
+        timestamp = u_realization[k]
+        m0 = int(math.floor((end_time - timestamp) / kernel_dt))
+        if m0 < 0:
+            continue
+        for d in range(n_basis):
+            if m0 >= kernel_size:
+                out[d] += basis_primitives[d, kernel_size - 1]
+            elif m0 > 0:
+                out[d] += basis_primitives[d, m0 - 1] + (end_time - timestamp - m0 * kernel_dt) * basis_kernels[d, m0]
+            else:
+                out[d] += (end_time - timestamp - m0 * kernel_dt) * basis_kernels[d, m0]
+
+
+def _basis_compute_C_numba_impl(u_realization, end_time, kernel_dt, basis_kernels, amplitude_sums, out):
+    if u_realization.size == 0:
+        return
+    n_basis, kernel_size = basis_kernels.shape
+    i = u_realization.size - 1
+    for m in range(kernel_size):
+        threshold = end_time - m * kernel_dt
+        while i >= 0 and u_realization[i] > threshold:
+            i -= 1
+        if i < 0:
+            break
+        for d in range(n_basis):
+            if basis_kernels[d, m] != 0.0:
+                out[d, m] += amplitude_sums[d] * (i + 1) / basis_kernels[d, m]
+
+
+def _basis_compute_mu_q_D_numba_impl(
+    u_index,
+    events,
+    sizes,
+    kernel_dt,
+    basis_kernels,
+    amplitudes_u,
+    baseline_u,
+    qvd,
+    Ddm,
+):
+    n_nodes = sizes.size
+    n_basis, kernel_size = basis_kernels.shape
+    u_size = sizes[u_index]
+    v_indices = np.empty(n_nodes, dtype=np.int64)
+    for v_index in range(n_nodes):
+        v_indices[v_index] = sizes[v_index]
+    qvd_temp = np.zeros((n_nodes, n_basis), dtype=np.float64)
+    Ddm_temp = np.zeros((n_basis, kernel_size), dtype=np.float64)
+    mu_out = 0.0
+
+    for i in range(u_size - 1, -1, -1):
+        norm = 0.0
+        for v_index in range(n_nodes):
+            for d in range(n_basis):
+                qvd_temp[v_index, d] = 0.0
+        for d in range(n_basis):
+            for m in range(kernel_size):
+                Ddm_temp[d, m] = 0.0
+        t_i = events[u_index, i]
+
+        for v_index in range(n_nodes):
+            v_size = sizes[v_index]
+            if v_size == 0:
+                continue
+            while True:
+                if v_indices[v_index] == 0:
+                    break
+                if v_indices[v_index] < v_size and t_i >= events[v_index, v_indices[v_index]]:
+                    break
+                v_indices[v_index] -= 1
+            if t_i < events[v_index, v_indices[v_index]]:
+                continue
+
+            for j in range(v_indices[v_index], -1, -1):
+                t_j = events[v_index, j]
+                if u_index == v_index and i == j:
+                    norm += baseline_u
+                else:
+                    m = int(math.floor((t_i - t_j) / kernel_dt))
+                    if m >= kernel_size:
+                        break
+                    for d in range(n_basis):
+                        value = amplitudes_u[v_index, d] * basis_kernels[d, m]
+                        qvd_temp[v_index, d] += value
+                        Ddm_temp[d, m] += value
+                        norm += value
+
+        if norm <= 0.0:
+            continue
+        mu_out += baseline_u / norm
+        scale_d = 1.0 / (norm * kernel_dt)
+        for d in range(n_basis):
+            for m in range(kernel_size):
+                Ddm[d, m] += Ddm_temp[d, m] * scale_d
+        for v_index in range(n_nodes):
+            for d in range(n_basis):
+                qvd[v_index, d] += amplitudes_u[v_index, d] * qvd_temp[v_index, d] / norm
+
+    return mu_out
+
+
+def _basis_compute_gdm_numba_impl(alpha, kernel_dt, basis_kernel, Cdm, Ddm, tol, max_iter):
+    for m in range(basis_kernel.size):
+        basis_kernel[m] = 0.0
+    max_rel_error = 0.0
+    kernel_size = basis_kernel.size
+
+    for n_iter in range(int(max_iter)):
+        max_rel_error = -1.0
+        for m in range(kernel_size):
+            left = 0.0 if m == 0 else basis_kernel[m - 1]
+            right = 0.0 if m == kernel_size - 1 else basis_kernel[m + 1]
+            a = 4.0 * alpha / (kernel_dt * kernel_dt) + Cdm[m]
+            b = -2.0 * alpha * (right + left) / (kernel_dt * kernel_dt)
+            c = -Ddm[m]
+            discriminant = b * b - 4.0 * a * c
+            sol = (-b + math.sqrt(max(discriminant, 0.0))) / (2.0 * a)
+            if n_iter != 0:
+                rel_error = sol if basis_kernel[m] == 0.0 else (sol - basis_kernel[m]) / basis_kernel[m]
+                max_rel_error = max(rel_error, max_rel_error)
+            basis_kernel[m] = sol
+        if n_iter > 0 and max_rel_error < tol:
+            break
+
+    return max_rel_error
+
+
+_basis_compute_r_numba = _compile(_basis_compute_r_numba_impl)
+_basis_compute_C_numba = _compile(_basis_compute_C_numba_impl)
+_basis_compute_mu_q_D_numba = _compile(_basis_compute_mu_q_D_numba_impl)
+_basis_compute_gdm_numba = _compile(_basis_compute_gdm_numba_impl)
+
+
+def _basis_compute_r(u_realization, end_time, kernel_dt, basis_kernels, basis_primitives, out):
+    if NUMBA_AVAILABLE:
+        _basis_compute_r_numba(u_realization, float(end_time), float(kernel_dt), basis_kernels, basis_primitives, out)
+        return
+    _basis_compute_r_reference(u_realization, end_time, kernel_dt, basis_kernels, basis_primitives, out)
+
+
+def _basis_compute_C(u_realization, end_time, kernel_dt, basis_kernels, amplitude_sums, out):
+    if NUMBA_AVAILABLE:
+        _basis_compute_C_numba(
+            u_realization,
+            float(end_time),
+            float(kernel_dt),
+            basis_kernels,
+            amplitude_sums,
+            out,
+        )
+        return
+    _basis_compute_C_reference(u_realization, end_time, kernel_dt, basis_kernels, amplitude_sums, out)
+
+
+def _basis_compute_mu_q_D(
+    u_index,
+    realization,
+    kernel_dt,
+    basis_kernels,
+    amplitudes_u,
+    baseline_u,
+    qvd,
+    Ddm,
+):
+    if NUMBA_AVAILABLE:
+        events, sizes = pack_realization(realization)
+        return _basis_compute_mu_q_D_numba(
+            int(u_index),
+            events,
+            sizes,
+            float(kernel_dt),
+            basis_kernels,
+            amplitudes_u,
+            float(baseline_u),
+            qvd,
+            Ddm,
+        )
+    return _basis_compute_mu_q_D_reference(
+        u_index,
+        realization,
+        kernel_dt,
+        basis_kernels,
+        amplitudes_u,
+        baseline_u,
+        qvd,
+        Ddm,
+    )
+
+
+def _basis_compute_gdm(alpha, kernel_dt, basis_kernel, Cdm, Ddm, tol, max_iter):
+    if NUMBA_AVAILABLE:
+        return _basis_compute_gdm_numba(
+            float(alpha),
+            float(kernel_dt),
+            basis_kernel,
+            Cdm,
+            Ddm,
+            float(tol),
+            int(max_iter),
+        )
+    return _basis_compute_gdm_reference(alpha, kernel_dt, basis_kernel, Cdm, Ddm, tol, max_iter)
 
 
 class HawkesBasisKernels(_LearnerBase):
@@ -2405,6 +3149,882 @@ class HawkesBasisKernels(_LearnerBase):
         return float(loss + amplitude_penalty + smoothness)
 
 
+def _conditional_law_pack_realization(realization, marks):
+    events, sizes = pack_realization(realization)
+    packed_marks = np.zeros_like(events)
+    for node, node_marks in enumerate(marks):
+        node_marks = np.ascontiguousarray(np.asarray(node_marks, dtype=float))
+        if node_marks.size != int(sizes[node]):
+            raise ValueError("marks must match timestamps length")
+        if node_marks.size:
+            packed_marks[node, : node_marks.size] = node_marks
+    return events, sizes, packed_marks
+
+
+def _conditional_law_pack_signal_pairs(pairs):
+    max_size = max((len(pair[0]) for pair in pairs), default=0)
+    x_values = np.zeros((len(pairs), max_size), dtype=float)
+    y_values = np.zeros((len(pairs), max_size), dtype=float)
+    sizes = np.zeros(len(pairs), dtype=np.int64)
+    for index, pair in enumerate(pairs):
+        x = np.ascontiguousarray(np.asarray(pair[0], dtype=float))
+        y = np.ascontiguousarray(np.asarray(pair[1], dtype=float))
+        if x.shape != y.shape:
+            raise ValueError("packed signal x/y arrays must have matching shapes")
+        sizes[index] = x.size
+        if x.size:
+            x_values[index, : x.size] = x
+            y_values[index, : y.size] = y
+    return x_values, y_values, sizes
+
+
+def _conditional_law_pack_linear_system(
+    ijl2index,
+    index2ijl,
+    mark_probabilities,
+    int_claw,
+    IG,
+    IG2,
+):
+    n_nodes = len(ijl2index)
+    max_marks = max((len(mark_probabilities[node]) for node in range(n_nodes)), default=0)
+    ijl_to_index = np.full((n_nodes, n_nodes, max_marks), -1, dtype=np.int64)
+    for i in range(n_nodes):
+        for j in range(n_nodes):
+            for l, index in enumerate(ijl2index[i][j]):
+                ijl_to_index[i, j, l] = int(index)
+
+    index2ijl_array = np.ascontiguousarray(np.asarray(index2ijl, dtype=np.int64))
+    mark_probabilities_array = np.zeros((n_nodes, max_marks), dtype=float)
+    for node, probabilities in enumerate(mark_probabilities):
+        probabilities = np.ascontiguousarray(np.asarray(probabilities, dtype=float))
+        if probabilities.size:
+            mark_probabilities_array[node, : probabilities.size] = probabilities
+
+    int_x, int_y, int_sizes = _conditional_law_pack_signal_pairs(int_claw)
+    ig_x, ig_y, ig_sizes = _conditional_law_pack_signal_pairs(IG)
+    ig2_x, ig2_y, ig2_sizes = _conditional_law_pack_signal_pairs(IG2)
+    return (
+        index2ijl_array,
+        ijl_to_index,
+        mark_probabilities_array,
+        int_x,
+        int_y,
+        int_sizes,
+        ig_x,
+        ig_y,
+        ig_sizes,
+        ig2_x,
+        ig2_y,
+        ig2_sizes,
+    )
+
+
+def _conditional_law_point_process_cond_law_reference(
+    events,
+    sizes,
+    marks,
+    y_node,
+    z_node,
+    lags,
+    zmin,
+    zmax,
+    y_T,
+    y_lambda,
+):
+    n_lags = lags.size - 1
+    res_x = np.zeros(n_lags, dtype=float)
+    res_y = np.zeros(n_lags, dtype=float)
+    lag_max = float(lags[n_lags])
+    tab_y_index = np.zeros(n_lags, dtype=np.int64)
+    n_terms = 0
+    y_index = 0
+    y_size = int(sizes[y_node])
+    z_size = int(sizes[z_node])
+    for z_index in range(z_size):
+        z_derivative = float(marks[z_node, z_index])
+        if z_index > 0:
+            z_derivative -= float(marks[z_node, z_index - 1])
+        if zmin < zmax and z_index > 0 and (zmin > z_derivative or z_derivative > zmax):
+            continue
+        z_t = float(events[z_node, z_index])
+        if z_t + lag_max >= y_T:
+            break
+        n_terms += 1
+        while y_index < y_size and float(events[y_node, y_index]) < z_t:
+            y_index += 1
+        if y_index >= y_size:
+            break
+        y_index_lag_delta = y_index
+        for k in range(n_lags):
+            lag = float(lags[k])
+            y_index_lag = y_index_lag_delta
+            while y_index_lag < y_size and float(events[y_node, y_index_lag]) <= z_t + lag:
+                y_index_lag += 1
+            if y_index_lag >= y_size:
+                y_index_lag_delta = y_size - 1
+                tab_y_index[k] = y_index_lag_delta
+                continue
+            ytlag = 0 if y_index_lag == 0 else y_index_lag - 1
+            y_index_lag_delta = max(y_index_lag, int(tab_y_index[k]))
+            while y_index_lag_delta < y_size and float(events[y_node, y_index_lag_delta]) <= z_t + lags[k + 1]:
+                y_index_lag_delta += 1
+            if y_index_lag_delta >= y_size:
+                y_index_lag_delta = y_size - 1
+                if y_index_lag == y_size - 1:
+                    tab_y_index[k] = y_index_lag_delta
+                    continue
+            tab_y_index[k] = y_index_lag_delta
+            ytlagdelta = 0 if y_index_lag_delta == 0 else y_index_lag_delta - 1
+            res_y[k] += ytlagdelta - ytlag
+    for k in range(n_lags):
+        if n_terms != 0:
+            res_y[k] /= n_terms
+        res_y[k] /= lags[k + 1] - lags[k]
+        res_y[k] -= y_lambda
+        res_x[k] = (lags[k + 1] + lags[k]) / 2.0
+    return res_x, res_y
+
+
+def _conditional_law_lin0_reference(x_values, y_values, size, t):
+    if t >= x_values[size - 1]:
+        return 0.0
+    index = int(np.searchsorted(x_values[:size], t))
+    if index == size - 1:
+        return float(y_values[index])
+    if abs(float(x_values[index]) - t) < abs(float(x_values[index + 1]) - t):
+        return float(y_values[index])
+    return float(y_values[index + 1])
+
+
+def _conditional_law_linc_reference(x_values, y_values, size, t):
+    if t >= x_values[size - 1]:
+        return float(y_values[size - 1])
+    index = int(np.searchsorted(x_values[:size], t))
+    if index == size - 1:
+        return float(y_values[index])
+    if abs(float(x_values[index]) - t) < abs(float(x_values[index + 1]) - t):
+        return float(y_values[index])
+    return float(y_values[index + 1])
+
+
+def _conditional_law_G_reference(i, j, l, t, ijl_to_index, int_x, int_y, int_sizes):
+    index = int(ijl_to_index[i, j, l])
+    return _conditional_law_lin0_reference(int_x[index], int_y[index], int(int_sizes[index]), float(t))
+
+
+def _conditional_law_DIG_reference(i, j, l, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes):
+    index = int(ijl_to_index[i, j, l])
+    size = int(ig_sizes[index])
+    return _conditional_law_linc_reference(ig_x[index], ig_y[index], size, float(t2)) - _conditional_law_linc_reference(
+        ig_x[index],
+        ig_y[index],
+        size,
+        float(t1),
+    )
+
+
+def _conditional_law_compute_V_reference(i, n_index, n_quad, index_first, index_last, index2ijl, ijl_to_index, quad_x, int_x, int_y, int_sizes):
+    V = np.zeros((n_index * n_quad, 1), dtype=float)
+    for index in range(index_first, index_last + 1):
+        _, j, l = index2ijl[index]
+        for n in range(n_quad):
+            row = (index - index_first) * n_quad + n
+            V[row, 0] = _conditional_law_G_reference(i, j, l, float(quad_x[n]), ijl_to_index, int_x, int_y, int_sizes)
+    return V
+
+
+def _conditional_law_compute_M_reference(
+    n_index,
+    n_quad,
+    index_first,
+    index_last,
+    method_code,
+    index2ijl,
+    ijl_to_index,
+    mean_intensity,
+    mark_probabilities,
+    quad_x,
+    quad_w,
+    int_x,
+    int_y,
+    int_sizes,
+    ig_x,
+    ig_y,
+    ig_sizes,
+    ig2_x,
+    ig2_y,
+    ig2_sizes,
+):
+    M = np.zeros((n_index * n_quad, n_index * n_quad), dtype=float)
+    for index in range(index_first, index_last + 1):
+        _, j, l = index2ijl[index]
+        for index1 in range(index_first, index_last + 1):
+            _, j1, l1 = index2ijl[index1]
+            fact = float(mean_intensity[j1] / mean_intensity[j])
+            mark_probability = float(mark_probabilities[j1, l1])
+            for n in range(n_quad):
+                for n1 in range(n_quad):
+                    if method_code in {0, 1}:
+                        if n > n1:
+                            x = mark_probability * float(quad_w[n1]) * _conditional_law_G_reference(
+                                j1,
+                                j,
+                                l,
+                                float(quad_x[n] - quad_x[n1]),
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                        elif n < n1:
+                            x = fact * mark_probability * float(quad_w[n1]) * _conditional_law_G_reference(
+                                j,
+                                j1,
+                                l1,
+                                float(quad_x[n1] - quad_x[n]),
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                        elif method_code == 1:
+                            x = 0.0
+                        else:
+                            x1 = mark_probability * float(quad_w[n1]) * _conditional_law_G_reference(
+                                j1,
+                                j,
+                                l,
+                                0.0,
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                            x2 = fact * mark_probability * float(quad_w[n1]) * _conditional_law_G_reference(
+                                j,
+                                j1,
+                                l1,
+                                0.0,
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                            x = (x1 + x2) / 2.0
+                        if method_code == 1:
+                            row = (index - index_first) * n_quad + n
+                            col = (index1 - index_first) * n_quad + n
+                            M[row, col] -= x
+                    else:
+                        x = _conditional_law_compute_M_log_lin_value_reference(
+                            n,
+                            n1,
+                            n_quad,
+                            j,
+                            l,
+                            j1,
+                            l1,
+                            fact,
+                            mark_probability,
+                            quad_x,
+                            quad_w,
+                            ijl_to_index,
+                            ig_x,
+                            ig_y,
+                            ig_sizes,
+                            ig2_x,
+                            ig2_y,
+                            ig2_sizes,
+                        )
+                    if l == l1 and j == j1 and n == n1:
+                        x += 1.0
+                    row = (index - index_first) * n_quad + n
+                    col = (index1 - index_first) * n_quad + n1
+                    M[row, col] += x
+    return M
+
+
+def _conditional_law_compute_M_log_lin_value_reference(
+    n,
+    n1,
+    n_quad,
+    j,
+    l,
+    j1,
+    l1,
+    fact,
+    mark_probability,
+    quad_x,
+    quad_w,
+    ijl_to_index,
+    ig_x,
+    ig_y,
+    ig_sizes,
+    ig2_x,
+    ig2_y,
+    ig2_sizes,
+):
+    def dig(j_lower, j_greater, l_greater, t1, t2):
+        return _conditional_law_DIG_reference(j_lower, j_greater, l_greater, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes)
+
+    def dig2(j_lower, j_greater, l_greater, t1, t2):
+        return _conditional_law_DIG_reference(j_lower, j_greater, l_greater, t1, t2, ijl_to_index, ig2_x, ig2_y, ig2_sizes)
+
+    def ratio_dig(n_q):
+        return (float(quad_x[n]) - float(quad_x[n_q])) / float(quad_w[n_q])
+
+    def ratio_dig2(n_q):
+        return 1.0 / float(quad_w[n_q])
+
+    def greater_args(n_q):
+        return (
+            j1,
+            j,
+            l,
+            float(quad_x[n] - quad_x[n_q] - quad_w[n_q]),
+            float(quad_x[n] - quad_x[n_q]),
+        )
+
+    def lower_args(n_q):
+        return (
+            j,
+            j1,
+            l1,
+            float(quad_x[n_q] - quad_x[n]),
+            float(quad_x[n_q] - quad_x[n] + quad_w[n_q]),
+        )
+
+    x = 0.0
+    if n > n1:
+        x += mark_probability * dig(*greater_args(n1))
+        if n1 < n_quad - 1:
+            x -= ratio_dig(n1) * mark_probability * dig(*greater_args(n1))
+            x += ratio_dig2(n1) * mark_probability * dig2(*greater_args(n1))
+        if n1 > 0:
+            x += ratio_dig(n1 - 1) * mark_probability * dig(*greater_args(n1 - 1))
+            x -= ratio_dig2(n1 - 1) * mark_probability * dig2(*greater_args(n1 - 1))
+    elif n < n1:
+        x += fact * mark_probability * dig(*lower_args(n1))
+        if n1 < n_quad - 1:
+            x -= fact * ratio_dig(n1) * mark_probability * dig(*lower_args(n1))
+            x -= fact * ratio_dig2(n1) * mark_probability * dig2(*lower_args(n1))
+        if n1 > 0:
+            x += fact * ratio_dig(n1 - 1) * mark_probability * dig(*lower_args(n1 - 1))
+            x += fact * ratio_dig2(n1 - 1) * mark_probability * dig2(*lower_args(n1 - 1))
+    else:
+        x += fact * mark_probability * dig(*lower_args(n1))
+        if n1 < n_quad - 1:
+            x -= fact * ratio_dig(n1) * mark_probability * dig(*lower_args(n1))
+            x -= fact * ratio_dig2(n1) * mark_probability * dig2(*lower_args(n1))
+        if n1 > 0:
+            x += ratio_dig(n1 - 1) * mark_probability * dig(*greater_args(n1 - 1))
+            x -= ratio_dig2(n1 - 1) * mark_probability * dig2(*greater_args(n1 - 1))
+    return x
+
+
+def _conditional_law_point_process_cond_law_numba_impl(
+    events,
+    sizes,
+    marks,
+    y_node,
+    z_node,
+    lags,
+    zmin,
+    zmax,
+    y_T,
+    y_lambda,
+    res_x,
+    res_y,
+):
+    n_lags = lags.size - 1
+    lag_max = lags[n_lags]
+    tab_y_index = np.zeros(n_lags, dtype=np.int64)
+    n_terms = 0
+    y_index = 0
+    y_size = sizes[y_node]
+    z_size = sizes[z_node]
+    for k in range(n_lags):
+        res_x[k] = 0.0
+        res_y[k] = 0.0
+    for z_index in range(z_size):
+        z_derivative = marks[z_node, z_index]
+        if z_index > 0:
+            z_derivative -= marks[z_node, z_index - 1]
+        if zmin < zmax and z_index > 0 and (zmin > z_derivative or z_derivative > zmax):
+            continue
+        z_t = events[z_node, z_index]
+        if z_t + lag_max >= y_T:
+            break
+        n_terms += 1
+        while y_index < y_size and events[y_node, y_index] < z_t:
+            y_index += 1
+        if y_index >= y_size:
+            break
+        y_index_lag_delta = y_index
+        for k in range(n_lags):
+            lag = lags[k]
+            y_index_lag = y_index_lag_delta
+            while y_index_lag < y_size and events[y_node, y_index_lag] <= z_t + lag:
+                y_index_lag += 1
+            if y_index_lag >= y_size:
+                y_index_lag_delta = y_size - 1
+                tab_y_index[k] = y_index_lag_delta
+                continue
+            ytlag = 0
+            if y_index_lag != 0:
+                ytlag = y_index_lag - 1
+            y_index_lag_delta = y_index_lag
+            if y_index_lag_delta < tab_y_index[k]:
+                y_index_lag_delta = tab_y_index[k]
+            while y_index_lag_delta < y_size and events[y_node, y_index_lag_delta] <= z_t + lags[k + 1]:
+                y_index_lag_delta += 1
+            if y_index_lag_delta >= y_size:
+                y_index_lag_delta = y_size - 1
+                if y_index_lag == y_size - 1:
+                    tab_y_index[k] = y_index_lag_delta
+                    continue
+            tab_y_index[k] = y_index_lag_delta
+            ytlagdelta = 0
+            if y_index_lag_delta != 0:
+                ytlagdelta = y_index_lag_delta - 1
+            res_y[k] += ytlagdelta - ytlag
+    for k in range(n_lags):
+        if n_terms != 0:
+            res_y[k] /= n_terms
+        res_y[k] /= lags[k + 1] - lags[k]
+        res_y[k] -= y_lambda
+        res_x[k] = (lags[k + 1] + lags[k]) / 2.0
+
+
+def _conditional_law_lin0_numba(x_values, y_values, size, t):
+    if t >= x_values[size - 1]:
+        return 0.0
+    index = 0
+    while index < size and x_values[index] < t:
+        index += 1
+    if index == size - 1:
+        return y_values[index]
+    if abs(x_values[index] - t) < abs(x_values[index + 1] - t):
+        return y_values[index]
+    return y_values[index + 1]
+
+
+def _conditional_law_linc_numba(x_values, y_values, size, t):
+    if t >= x_values[size - 1]:
+        return y_values[size - 1]
+    index = 0
+    while index < size and x_values[index] < t:
+        index += 1
+    if index == size - 1:
+        return y_values[index]
+    if abs(x_values[index] - t) < abs(x_values[index + 1] - t):
+        return y_values[index]
+    return y_values[index + 1]
+
+
+def _conditional_law_G_numba(i, j, l, t, ijl_to_index, int_x, int_y, int_sizes):
+    index = ijl_to_index[i, j, l]
+    return _conditional_law_lin0_numba(int_x[index], int_y[index], int_sizes[index], t)
+
+
+def _conditional_law_DIG_numba(i, j, l, t1, t2, ijl_to_index, x_values, y_values, sizes):
+    index = ijl_to_index[i, j, l]
+    size = sizes[index]
+    return _conditional_law_linc_numba(x_values[index], y_values[index], size, t2) - _conditional_law_linc_numba(
+        x_values[index],
+        y_values[index],
+        size,
+        t1,
+    )
+
+
+def _conditional_law_compute_V_numba_impl(i, n_index, n_quad, index_first, index_last, index2ijl, ijl_to_index, quad_x, int_x, int_y, int_sizes, V):
+    for row in range(n_index * n_quad):
+        V[row, 0] = 0.0
+    for index in range(index_first, index_last + 1):
+        j = index2ijl[index, 1]
+        l = index2ijl[index, 2]
+        for n in range(n_quad):
+            row = (index - index_first) * n_quad + n
+            V[row, 0] = _conditional_law_G_numba(i, j, l, quad_x[n], ijl_to_index, int_x, int_y, int_sizes)
+
+
+def _conditional_law_compute_M_log_lin_value_numba(
+    n,
+    n1,
+    n_quad,
+    j,
+    l,
+    j1,
+    l1,
+    fact,
+    mark_probability,
+    quad_x,
+    quad_w,
+    ijl_to_index,
+    ig_x,
+    ig_y,
+    ig_sizes,
+    ig2_x,
+    ig2_y,
+    ig2_sizes,
+):
+    x = 0.0
+    if n > n1:
+        t1 = quad_x[n] - quad_x[n1] - quad_w[n1]
+        t2 = quad_x[n] - quad_x[n1]
+        dig = _conditional_law_DIG_numba(j1, j, l, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes)
+        dig2 = _conditional_law_DIG_numba(j1, j, l, t1, t2, ijl_to_index, ig2_x, ig2_y, ig2_sizes)
+        x += mark_probability * dig
+        if n1 < n_quad - 1:
+            ratio = (quad_x[n] - quad_x[n1]) / quad_w[n1]
+            x -= ratio * mark_probability * dig
+            x += (1.0 / quad_w[n1]) * mark_probability * dig2
+        if n1 > 0:
+            t1 = quad_x[n] - quad_x[n1 - 1] - quad_w[n1 - 1]
+            t2 = quad_x[n] - quad_x[n1 - 1]
+            dig = _conditional_law_DIG_numba(j1, j, l, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes)
+            dig2 = _conditional_law_DIG_numba(j1, j, l, t1, t2, ijl_to_index, ig2_x, ig2_y, ig2_sizes)
+            ratio = (quad_x[n] - quad_x[n1 - 1]) / quad_w[n1 - 1]
+            x += ratio * mark_probability * dig
+            x -= (1.0 / quad_w[n1 - 1]) * mark_probability * dig2
+    elif n < n1:
+        t1 = quad_x[n1] - quad_x[n]
+        t2 = quad_x[n1] - quad_x[n] + quad_w[n1]
+        dig = _conditional_law_DIG_numba(j, j1, l1, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes)
+        dig2 = _conditional_law_DIG_numba(j, j1, l1, t1, t2, ijl_to_index, ig2_x, ig2_y, ig2_sizes)
+        x += fact * mark_probability * dig
+        if n1 < n_quad - 1:
+            ratio = (quad_x[n] - quad_x[n1]) / quad_w[n1]
+            x -= fact * ratio * mark_probability * dig
+            x -= fact * (1.0 / quad_w[n1]) * mark_probability * dig2
+        if n1 > 0:
+            t1 = quad_x[n1 - 1] - quad_x[n]
+            t2 = quad_x[n1 - 1] - quad_x[n] + quad_w[n1 - 1]
+            dig = _conditional_law_DIG_numba(j, j1, l1, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes)
+            dig2 = _conditional_law_DIG_numba(j, j1, l1, t1, t2, ijl_to_index, ig2_x, ig2_y, ig2_sizes)
+            ratio = (quad_x[n] - quad_x[n1 - 1]) / quad_w[n1 - 1]
+            x += fact * ratio * mark_probability * dig
+            x += fact * (1.0 / quad_w[n1 - 1]) * mark_probability * dig2
+    else:
+        t1 = quad_x[n1] - quad_x[n]
+        t2 = quad_x[n1] - quad_x[n] + quad_w[n1]
+        dig = _conditional_law_DIG_numba(j, j1, l1, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes)
+        dig2 = _conditional_law_DIG_numba(j, j1, l1, t1, t2, ijl_to_index, ig2_x, ig2_y, ig2_sizes)
+        x += fact * mark_probability * dig
+        if n1 < n_quad - 1:
+            ratio = (quad_x[n] - quad_x[n1]) / quad_w[n1]
+            x -= fact * ratio * mark_probability * dig
+            x -= fact * (1.0 / quad_w[n1]) * mark_probability * dig2
+        if n1 > 0:
+            t1 = quad_x[n] - quad_x[n1 - 1] - quad_w[n1 - 1]
+            t2 = quad_x[n] - quad_x[n1 - 1]
+            dig = _conditional_law_DIG_numba(j1, j, l, t1, t2, ijl_to_index, ig_x, ig_y, ig_sizes)
+            dig2 = _conditional_law_DIG_numba(j1, j, l, t1, t2, ijl_to_index, ig2_x, ig2_y, ig2_sizes)
+            ratio = (quad_x[n] - quad_x[n1 - 1]) / quad_w[n1 - 1]
+            x += ratio * mark_probability * dig
+            x -= (1.0 / quad_w[n1 - 1]) * mark_probability * dig2
+    return x
+
+
+def _conditional_law_compute_M_numba_impl(
+    n_index,
+    n_quad,
+    index_first,
+    index_last,
+    method_code,
+    index2ijl,
+    ijl_to_index,
+    mean_intensity,
+    mark_probabilities,
+    quad_x,
+    quad_w,
+    int_x,
+    int_y,
+    int_sizes,
+    ig_x,
+    ig_y,
+    ig_sizes,
+    ig2_x,
+    ig2_y,
+    ig2_sizes,
+    M,
+):
+    for row in range(n_index * n_quad):
+        for col in range(n_index * n_quad):
+            M[row, col] = 0.0
+    for index in range(index_first, index_last + 1):
+        j = index2ijl[index, 1]
+        l = index2ijl[index, 2]
+        for index1 in range(index_first, index_last + 1):
+            j1 = index2ijl[index1, 1]
+            l1 = index2ijl[index1, 2]
+            fact = mean_intensity[j1] / mean_intensity[j]
+            mark_probability = mark_probabilities[j1, l1]
+            for n in range(n_quad):
+                for n1 in range(n_quad):
+                    if method_code == 0 or method_code == 1:
+                        if n > n1:
+                            x = mark_probability * quad_w[n1] * _conditional_law_G_numba(
+                                j1,
+                                j,
+                                l,
+                                quad_x[n] - quad_x[n1],
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                        elif n < n1:
+                            x = fact * mark_probability * quad_w[n1] * _conditional_law_G_numba(
+                                j,
+                                j1,
+                                l1,
+                                quad_x[n1] - quad_x[n],
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                        elif method_code == 1:
+                            x = 0.0
+                        else:
+                            x1 = mark_probability * quad_w[n1] * _conditional_law_G_numba(
+                                j1,
+                                j,
+                                l,
+                                0.0,
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                            x2 = fact * mark_probability * quad_w[n1] * _conditional_law_G_numba(
+                                j,
+                                j1,
+                                l1,
+                                0.0,
+                                ijl_to_index,
+                                int_x,
+                                int_y,
+                                int_sizes,
+                            )
+                            x = (x1 + x2) / 2.0
+                        if method_code == 1:
+                            row = (index - index_first) * n_quad + n
+                            col = (index1 - index_first) * n_quad + n
+                            M[row, col] -= x
+                    else:
+                        x = _conditional_law_compute_M_log_lin_value_numba(
+                            n,
+                            n1,
+                            n_quad,
+                            j,
+                            l,
+                            j1,
+                            l1,
+                            fact,
+                            mark_probability,
+                            quad_x,
+                            quad_w,
+                            ijl_to_index,
+                            ig_x,
+                            ig_y,
+                            ig_sizes,
+                            ig2_x,
+                            ig2_y,
+                            ig2_sizes,
+                        )
+                    if l == l1 and j == j1 and n == n1:
+                        x += 1.0
+                    row = (index - index_first) * n_quad + n
+                    col = (index1 - index_first) * n_quad + n1
+                    M[row, col] += x
+
+
+_conditional_law_lin0_numba = _compile(_conditional_law_lin0_numba)
+_conditional_law_linc_numba = _compile(_conditional_law_linc_numba)
+_conditional_law_G_numba = _compile(_conditional_law_G_numba)
+_conditional_law_DIG_numba = _compile(_conditional_law_DIG_numba)
+_conditional_law_compute_M_log_lin_value_numba = _compile(_conditional_law_compute_M_log_lin_value_numba)
+_conditional_law_point_process_cond_law_numba = _compile(_conditional_law_point_process_cond_law_numba_impl)
+_conditional_law_compute_V_numba = _compile(_conditional_law_compute_V_numba_impl)
+_conditional_law_compute_M_numba = _compile(_conditional_law_compute_M_numba_impl)
+
+
+def _conditional_law_method_code(method):
+    if method == "gauss":
+        return 0
+    if method == "gauss-":
+        return 1
+    return 2
+
+
+def _conditional_law_point_process_cond_law(events, sizes, marks, y_node, z_node, lags, zmin, zmax, y_T, y_lambda):
+    events = np.ascontiguousarray(np.asarray(events, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    marks = np.ascontiguousarray(np.asarray(marks, dtype=float))
+    lags = np.ascontiguousarray(np.asarray(lags, dtype=float))
+    if NUMBA_AVAILABLE:
+        res_x = np.zeros(lags.size - 1, dtype=float)
+        res_y = np.zeros(lags.size - 1, dtype=float)
+        _conditional_law_point_process_cond_law_numba(
+            events,
+            sizes,
+            marks,
+            int(y_node),
+            int(z_node),
+            lags,
+            float(zmin),
+            float(zmax),
+            float(y_T),
+            float(y_lambda),
+            res_x,
+            res_y,
+        )
+        return res_x, res_y
+    return _conditional_law_point_process_cond_law_reference(
+        events,
+        sizes,
+        marks,
+        int(y_node),
+        int(z_node),
+        lags,
+        zmin,
+        zmax,
+        y_T,
+        y_lambda,
+    )
+
+
+def _conditional_law_compute_V(i, n_index, n_quad, index_first, index_last, index2ijl, ijl_to_index, quad_x, int_x, int_y, int_sizes):
+    index2ijl = np.ascontiguousarray(np.asarray(index2ijl, dtype=np.int64))
+    ijl_to_index = np.ascontiguousarray(np.asarray(ijl_to_index, dtype=np.int64))
+    quad_x = np.ascontiguousarray(np.asarray(quad_x, dtype=float))
+    int_x = np.ascontiguousarray(np.asarray(int_x, dtype=float))
+    int_y = np.ascontiguousarray(np.asarray(int_y, dtype=float))
+    int_sizes = np.ascontiguousarray(np.asarray(int_sizes, dtype=np.int64))
+    if NUMBA_AVAILABLE:
+        V = np.empty((int(n_index) * int(n_quad), 1), dtype=float)
+        _conditional_law_compute_V_numba(
+            int(i),
+            int(n_index),
+            int(n_quad),
+            int(index_first),
+            int(index_last),
+            index2ijl,
+            ijl_to_index,
+            quad_x,
+            int_x,
+            int_y,
+            int_sizes,
+            V,
+        )
+        return V
+    return _conditional_law_compute_V_reference(
+        int(i),
+        int(n_index),
+        int(n_quad),
+        int(index_first),
+        int(index_last),
+        index2ijl,
+        ijl_to_index,
+        quad_x,
+        int_x,
+        int_y,
+        int_sizes,
+    )
+
+
+def _conditional_law_compute_M(
+    n_index,
+    n_quad,
+    index_first,
+    index_last,
+    method,
+    index2ijl,
+    ijl_to_index,
+    mean_intensity,
+    mark_probabilities,
+    quad_x,
+    quad_w,
+    int_x,
+    int_y,
+    int_sizes,
+    ig_x,
+    ig_y,
+    ig_sizes,
+    ig2_x,
+    ig2_y,
+    ig2_sizes,
+):
+    method_code = _conditional_law_method_code(method)
+    index2ijl = np.ascontiguousarray(np.asarray(index2ijl, dtype=np.int64))
+    ijl_to_index = np.ascontiguousarray(np.asarray(ijl_to_index, dtype=np.int64))
+    mean_intensity = np.ascontiguousarray(np.asarray(mean_intensity, dtype=float))
+    mark_probabilities = np.ascontiguousarray(np.asarray(mark_probabilities, dtype=float))
+    quad_x = np.ascontiguousarray(np.asarray(quad_x, dtype=float))
+    quad_w = np.ascontiguousarray(np.asarray(quad_w, dtype=float))
+    int_x = np.ascontiguousarray(np.asarray(int_x, dtype=float))
+    int_y = np.ascontiguousarray(np.asarray(int_y, dtype=float))
+    int_sizes = np.ascontiguousarray(np.asarray(int_sizes, dtype=np.int64))
+    ig_x = np.ascontiguousarray(np.asarray(ig_x, dtype=float))
+    ig_y = np.ascontiguousarray(np.asarray(ig_y, dtype=float))
+    ig_sizes = np.ascontiguousarray(np.asarray(ig_sizes, dtype=np.int64))
+    ig2_x = np.ascontiguousarray(np.asarray(ig2_x, dtype=float))
+    ig2_y = np.ascontiguousarray(np.asarray(ig2_y, dtype=float))
+    ig2_sizes = np.ascontiguousarray(np.asarray(ig2_sizes, dtype=np.int64))
+    if NUMBA_AVAILABLE:
+        M = np.empty((int(n_index) * int(n_quad), int(n_index) * int(n_quad)), dtype=float)
+        _conditional_law_compute_M_numba(
+            int(n_index),
+            int(n_quad),
+            int(index_first),
+            int(index_last),
+            int(method_code),
+            index2ijl,
+            ijl_to_index,
+            mean_intensity,
+            mark_probabilities,
+            quad_x,
+            quad_w,
+            int_x,
+            int_y,
+            int_sizes,
+            ig_x,
+            ig_y,
+            ig_sizes,
+            ig2_x,
+            ig2_y,
+            ig2_sizes,
+            M,
+        )
+        return M
+    return _conditional_law_compute_M_reference(
+        int(n_index),
+        int(n_quad),
+        int(index_first),
+        int(index_last),
+        method_code,
+        index2ijl,
+        ijl_to_index,
+        mean_intensity,
+        mark_probabilities,
+        quad_x,
+        quad_w,
+        int_x,
+        int_y,
+        int_sizes,
+        ig_x,
+        ig_y,
+        ig_sizes,
+        ig2_x,
+        ig2_y,
+        ig2_sizes,
+    )
+
+
 class HawkesConditionalLaw(_LearnerBase):
     """Empirical conditional-law estimator with tick-compatible outputs."""
 
@@ -2474,6 +4094,8 @@ class HawkesConditionalLaw(_LearnerBase):
         self._computed = False
         self._quad_x = None
         self._quad_w = None
+        self._packed_realizations = []
+        self._conditional_linear_pack = None
         self.set_model(model if model is not None else {})
 
     def set_model(self, symmetries1d=None, symmetries2d=None, delayed_component=_UNSET, **kwargs):
@@ -2511,6 +4133,8 @@ class HawkesConditionalLaw(_LearnerBase):
         self._fitted = True
         self._computed = False
         self.mark_functions = None
+        self._packed_realizations = []
+        self._conditional_linear_pack = None
         self._init_marked_components()
         self._init_index()
         for realization, realization_marks, end_time in zip(data, marks, end_times_arr):
@@ -2529,6 +4153,8 @@ class HawkesConditionalLaw(_LearnerBase):
             self._end_times = np.empty(0, dtype=float)
             self._n_nodes = int(n_nodes)
             self._fitted = True
+            self._packed_realizations = []
+            self._conditional_linear_pack = None
             self._init_marked_components()
             self._init_index()
         elif int(n_nodes) != self._n_nodes:
@@ -2691,6 +4317,8 @@ class HawkesConditionalLaw(_LearnerBase):
         self.data.append(stored)
         self._marks.append(stored_marks)
         self._end_times = np.append(self._end_times, float(end_time))
+        self._packed_realizations.append(_conditional_law_pack_realization(stored, stored_marks))
+        self._conditional_linear_pack = None
 
     def _compute_lags(self):
         if self.claw_method == "log":
@@ -2805,6 +4433,11 @@ class HawkesConditionalLaw(_LearnerBase):
         self._estimate_mark_functions()
 
     def _compute_tick_conditional_laws(self):
+        if len(self._packed_realizations) != len(self.data):
+            self._packed_realizations = [
+                _conditional_law_pack_realization(realization, marks)
+                for realization, marks in zip(self.data, self._marks)
+            ]
         n_marks = [len(intervals) for intervals in self.marked_components]
         self._mark_probabilities_N = [np.zeros(n, dtype=float) for n in n_marks]
         self._mark_probabilities = [np.zeros(n, dtype=float) for n in n_marks]
@@ -2818,8 +4451,9 @@ class HawkesConditionalLaw(_LearnerBase):
         n_realizations = len(self.data)
         self._claw_X = np.zeros(len(self._lags) - 1, dtype=float)
 
-        for realization, marks, end_time in zip(self.data, self._marks, self._end_times):
+        for r, (realization, marks, end_time) in enumerate(zip(self.data, self._marks, self._end_times)):
             end_time = float(end_time)
+            packed_events, packed_sizes, packed_marks = self._packed_realizations[r]
             for i in range(self.n_nodes):
                 if realization[i].size == 0:
                     continue
@@ -2845,10 +4479,12 @@ class HawkesConditionalLaw(_LearnerBase):
 
             for index, (i, j, l) in enumerate(self._index2ijl):
                 lambda_i = realization[i].size / end_time if end_time > 0 else 0.0
-                claw_x, claw_y = self._point_process_cond_law(
-                    realization[i],
-                    realization[j],
-                    marks[j],
+                claw_x, claw_y = _conditional_law_point_process_cond_law(
+                    packed_events,
+                    packed_sizes,
+                    packed_marks,
+                    i,
+                    j,
                     self._lags,
                     self.marked_components[j][l][0],
                     self.marked_components[j][l][1],
@@ -2878,57 +4514,11 @@ class HawkesConditionalLaw(_LearnerBase):
     def _point_process_cond_law(y_time, z_time, z_mark, lags, zmin, zmax, y_T, y_lambda):
         if z_time.size != z_mark.size:
             raise ValueError("z_time and z_mark should have the same size")
-        n_lags = lags.size - 1
-        res_x = np.zeros(n_lags, dtype=float)
-        res_y = np.zeros(n_lags, dtype=float)
-        lag_max = lags[n_lags]
-        tab_y_index = np.zeros(n_lags, dtype=int)
-        n_terms = 0
-        y_index = 0
-        for z_index in range(z_mark.size):
-            if (
-                zmin < zmax
-                and z_index > 0
-                and (zmin > z_mark[z_index] - z_mark[z_index - 1] or z_mark[z_index] - z_mark[z_index - 1] > zmax)
-            ):
-                continue
-            z_t = z_time[z_index]
-            if z_t + lag_max >= y_T:
-                break
-            n_terms += 1
-            while y_index < y_time.size and y_time[y_index] < z_t:
-                y_index += 1
-            if y_index >= y_time.size:
-                break
-            y_index_lag_delta = y_index
-            for k in range(n_lags):
-                lag = lags[k]
-                y_index_lag = y_index_lag_delta
-                while y_index_lag < y_time.size and y_time[y_index_lag] <= z_t + lag:
-                    y_index_lag += 1
-                if y_index_lag >= y_time.size:
-                    y_index_lag_delta = y_time.size - 1
-                    tab_y_index[k] = y_index_lag_delta
-                    continue
-                ytlag = 0 if y_index_lag == 0 else y_index_lag - 1
-                y_index_lag_delta = max(y_index_lag, tab_y_index[k])
-                while y_index_lag_delta < y_time.size and y_time[y_index_lag_delta] <= z_t + lags[k + 1]:
-                    y_index_lag_delta += 1
-                if y_index_lag_delta >= y_time.size:
-                    y_index_lag_delta = y_time.size - 1
-                    if y_index_lag == y_time.size - 1:
-                        tab_y_index[k] = y_index_lag_delta
-                        continue
-                tab_y_index[k] = y_index_lag_delta
-                ytlagdelta = 0 if y_index_lag_delta == 0 else y_index_lag_delta - 1
-                res_y[k] += ytlagdelta - ytlag
-        for k in range(n_lags):
-            if n_terms != 0:
-                res_y[k] /= n_terms
-            res_y[k] /= lags[k + 1] - lags[k]
-            res_y[k] -= y_lambda
-            res_x[k] = (lags[k + 1] + lags[k]) / 2.0
-        return res_x, res_y
+        events, sizes, marks = _conditional_law_pack_realization(
+            [y_time, z_time],
+            [np.zeros_like(y_time, dtype=float), z_mark],
+        )
+        return _conditional_law_point_process_cond_law(events, sizes, marks, 0, 1, lags, zmin, zmax, y_T, y_lambda)
 
     def _aggregate_unmarked_claws(self):
         claw1 = []
@@ -3038,6 +4628,14 @@ class HawkesConditionalLaw(_LearnerBase):
                     ),
                 )
             )
+        self._conditional_linear_pack = _conditional_law_pack_linear_system(
+            self._ijl2index,
+            self._index2ijl,
+            self._mark_probabilities,
+            self._int_claw,
+            self._IG,
+            self._IG2,
+        )
 
     @staticmethod
     def _lin0(sig, t):
@@ -3080,28 +4678,76 @@ class HawkesConditionalLaw(_LearnerBase):
         return self._linc(self._IG2[index], t2) - self._linc(self._IG2[index], t1)
 
     def _compute_V(self, i, n_index, n_quad, index_first, index_last):
-        V = np.zeros((n_index * n_quad, 1), dtype=float)
-        for index in range(index_first, index_last + 1):
-            _, j, l = self._index2ijl[index]
-            for n in range(n_quad):
-                row = (index - index_first) * n_quad + n
-                V[row] = self._G(i, j, l, self._quad_x[n])
-        return V
+        if self._conditional_linear_pack is None:
+            self._conditional_linear_pack = _conditional_law_pack_linear_system(
+                self._ijl2index,
+                self._index2ijl,
+                self._mark_probabilities,
+                self._int_claw,
+                self._IG,
+                self._IG2,
+            )
+        index2ijl, ijl_to_index, _, int_x, int_y, int_sizes, *_ = self._conditional_linear_pack
+        return _conditional_law_compute_V(
+            i,
+            n_index,
+            n_quad,
+            index_first,
+            index_last,
+            index2ijl,
+            ijl_to_index,
+            self._quad_x,
+            int_x,
+            int_y,
+            int_sizes,
+        )
 
     def _compute_M(self, n_index, n_quad, index_first, index_last, method):
-        M = np.zeros((n_index * n_quad, n_index * n_quad), dtype=float)
-        for index in range(index_first, index_last + 1):
-            _, j, l = self._index2ijl[index]
-            for index1 in range(index_first, index_last + 1):
-                _, j1, l1 = self._index2ijl[index1]
-                fact = self.mean_intensity[j1] / self.mean_intensity[j]
-                for n in range(n_quad):
-                    for n1 in range(n_quad):
-                        if method in {"gauss", "gauss-"}:
-                            self._fill_M_for_gauss(M, method, n_quad, index_first, index, index1, j, l, j1, l1, fact, n, n1)
-                        elif method in {"log", "lin"}:
-                            self._fill_M_for_log_lin(M, method, n_quad, index_first, index, index1, j, l, j1, l1, fact, n, n1)
-        return M
+        if self._conditional_linear_pack is None:
+            self._conditional_linear_pack = _conditional_law_pack_linear_system(
+                self._ijl2index,
+                self._index2ijl,
+                self._mark_probabilities,
+                self._int_claw,
+                self._IG,
+                self._IG2,
+            )
+        (
+            index2ijl,
+            ijl_to_index,
+            mark_probabilities,
+            int_x,
+            int_y,
+            int_sizes,
+            ig_x,
+            ig_y,
+            ig_sizes,
+            ig2_x,
+            ig2_y,
+            ig2_sizes,
+        ) = self._conditional_linear_pack
+        return _conditional_law_compute_M(
+            n_index,
+            n_quad,
+            index_first,
+            index_last,
+            method,
+            index2ijl,
+            ijl_to_index,
+            self.mean_intensity,
+            mark_probabilities,
+            self._quad_x,
+            self._quad_w,
+            int_x,
+            int_y,
+            int_sizes,
+            ig_x,
+            ig_y,
+            ig_sizes,
+            ig2_x,
+            ig2_y,
+            ig2_sizes,
+        )
 
     def _fill_M_for_gauss(self, M, method, n_quad, index_first, index, index1, j, l, j1, l1, fact, n, n1):
         def x_value(n_lower, n_greater, j_lower, j_greater, l_greater):
@@ -3477,6 +5123,183 @@ class HawkesTheoreticalCumulant(BaseEstimator):
         self.compute_skewness()
 
 
+def _cumulant_compute_A_and_I_reference(events, sizes, i, j, end_time, support, mean_intensity_j):
+    n_j = int(sizes[j])
+    res_C = 0.0
+    res_J = 0.0
+    width = 2.0 * float(support)
+    trend_C_j = float(mean_intensity_j) * width
+    trend_J_j = float(mean_intensity_j) * width * width
+    last_l = 0
+    for event_index in range(int(sizes[i])):
+        t_i_k = float(events[i, event_index])
+        if t_i_k - support < 0:
+            continue
+        while last_l < n_j and float(events[j, last_l]) <= t_i_k - width:
+            last_l += 1
+        l = last_l
+        timestamps_in_interval = 0
+        sub_res = 0.0
+        while l < n_j:
+            abs_delta = abs(float(events[j, l]) - t_i_k)
+            if abs_delta < width:
+                sub_res += width - abs_delta
+                if abs_delta < support:
+                    timestamps_in_interval += 1
+            else:
+                break
+            l += 1
+        if l == n_j:
+            continue
+        res_C += timestamps_in_interval - trend_C_j
+        res_J += sub_res - trend_J_j
+    return res_C / float(end_time), res_J / float(end_time)
+
+
+def _cumulant_compute_E_reference(events, sizes, i, j, k, end_time, support, mean_intensity_i, mean_intensity_j, J_ij):
+    n_i = int(sizes[i])
+    n_j = int(sizes[j])
+    res = 0.0
+    last_l = 0
+    last_m = 0
+    trend_i = float(mean_intensity_i) * 2.0 * float(support)
+    trend_j = float(mean_intensity_j) * 2.0 * float(support)
+    for tau_index in range(int(sizes[k])):
+        tau = float(events[k, tau_index])
+        if tau - support < 0:
+            continue
+        while last_l < n_i and float(events[i, last_l]) <= tau - support:
+            last_l += 1
+        l = last_l
+        while l < n_i and float(events[i, l]) < tau + support:
+            l += 1
+        while last_m < n_j and float(events[j, last_m]) <= tau - support:
+            last_m += 1
+        m = last_m
+        while m < n_j and float(events[j, m]) < tau + support:
+            m += 1
+        if m == n_j or l == n_i:
+            continue
+        res += (l - last_l - trend_i) * (m - last_m - trend_j) - float(J_ij)
+    return res / float(end_time)
+
+
+def _cumulant_compute_A_and_I_numba_impl(events, sizes, i, j, end_time, support, mean_intensity_j):
+    n_j = sizes[j]
+    res_C = 0.0
+    res_J = 0.0
+    width = 2.0 * support
+    trend_C_j = mean_intensity_j * width
+    trend_J_j = mean_intensity_j * width * width
+    last_l = 0
+    for event_index in range(sizes[i]):
+        t_i_k = events[i, event_index]
+        if t_i_k - support < 0.0:
+            continue
+        while last_l < n_j and events[j, last_l] <= t_i_k - width:
+            last_l += 1
+        l = last_l
+        timestamps_in_interval = 0
+        sub_res = 0.0
+        while l < n_j:
+            abs_delta = abs(events[j, l] - t_i_k)
+            if abs_delta < width:
+                sub_res += width - abs_delta
+                if abs_delta < support:
+                    timestamps_in_interval += 1
+            else:
+                break
+            l += 1
+        if l == n_j:
+            continue
+        res_C += timestamps_in_interval - trend_C_j
+        res_J += sub_res - trend_J_j
+    return res_C / end_time, res_J / end_time
+
+
+def _cumulant_compute_E_numba_impl(events, sizes, i, j, k, end_time, support, mean_intensity_i, mean_intensity_j, J_ij):
+    n_i = sizes[i]
+    n_j = sizes[j]
+    res = 0.0
+    last_l = 0
+    last_m = 0
+    trend_i = mean_intensity_i * 2.0 * support
+    trend_j = mean_intensity_j * 2.0 * support
+    for tau_index in range(sizes[k]):
+        tau = events[k, tau_index]
+        if tau - support < 0.0:
+            continue
+        while last_l < n_i and events[i, last_l] <= tau - support:
+            last_l += 1
+        l = last_l
+        while l < n_i and events[i, l] < tau + support:
+            l += 1
+        while last_m < n_j and events[j, last_m] <= tau - support:
+            last_m += 1
+        m = last_m
+        while m < n_j and events[j, m] < tau + support:
+            m += 1
+        if m == n_j or l == n_i:
+            continue
+        res += (l - last_l - trend_i) * (m - last_m - trend_j) - J_ij
+    return res / end_time
+
+
+_cumulant_compute_A_and_I_numba = _compile(_cumulant_compute_A_and_I_numba_impl)
+_cumulant_compute_E_numba = _compile(_cumulant_compute_E_numba_impl)
+
+
+def _cumulant_compute_A_and_I(events, sizes, i, j, end_time, support, mean_intensity_j):
+    events = np.ascontiguousarray(np.asarray(events, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    i = int(i)
+    j = int(j)
+    if NUMBA_AVAILABLE:
+        return _cumulant_compute_A_and_I_numba(
+            events,
+            sizes,
+            i,
+            j,
+            float(end_time),
+            float(support),
+            float(mean_intensity_j),
+        )
+    return _cumulant_compute_A_and_I_reference(events, sizes, i, j, end_time, support, mean_intensity_j)
+
+
+def _cumulant_compute_E(events, sizes, i, j, k, end_time, support, mean_intensity_i, mean_intensity_j, J_ij):
+    events = np.ascontiguousarray(np.asarray(events, dtype=float))
+    sizes = np.ascontiguousarray(np.asarray(sizes, dtype=np.int64))
+    i = int(i)
+    j = int(j)
+    k = int(k)
+    if NUMBA_AVAILABLE:
+        return _cumulant_compute_E_numba(
+            events,
+            sizes,
+            i,
+            j,
+            k,
+            float(end_time),
+            float(support),
+            float(mean_intensity_i),
+            float(mean_intensity_j),
+            float(J_ij),
+        )
+    return _cumulant_compute_E_reference(
+        events,
+        sizes,
+        i,
+        j,
+        k,
+        end_time,
+        support,
+        mean_intensity_i,
+        mean_intensity_j,
+        J_ij,
+    )
+
+
 class _HawkesCumulantComputer:
     """Pure-Python port of tick's Hawkes cumulant C++ helper."""
 
@@ -3493,6 +5316,8 @@ class _HawkesCumulantComputer:
         self._realizations = []
         self._end_times = np.empty(0, dtype=float)
         self._n_nodes = 0
+        self._packed_realizations = []
+        self._packed_sizes = []
 
     @property
     def integration_support(self):
@@ -3517,6 +5342,8 @@ class _HawkesCumulantComputer:
         if n_nodes is None:
             n_nodes = len(self._realizations[0]) if self._realizations else 0
         self._n_nodes = int(n_nodes)
+        self._packed_realizations = []
+        self._packed_sizes = []
 
     @staticmethod
     def _same_realizations(events_1, events_2):
@@ -3565,10 +5392,19 @@ class _HawkesCumulantComputer:
                 print("Use previouly computed cumulants")
             return
         self._events_of_cumulants = self.realizations
+        self._pack_realizations()
         self.compute_L()
         self.compute_C_and_J()
         self.K_c = self.compute_E_c()
         self._are_cumulants_ready = True
+
+    def _pack_realizations(self):
+        self._packed_realizations = []
+        self._packed_sizes = []
+        for realization in self.realizations:
+            events, sizes = pack_realization(realization)
+            self._packed_realizations.append(events)
+            self._packed_sizes.append(sizes)
 
     def compute_L(self):
         self._L_day = np.zeros((self.n_realizations, self.n_nodes), dtype=float)
@@ -3578,16 +5414,22 @@ class _HawkesCumulantComputer:
         self.L = np.mean(self._L_day, axis=0)
 
     def compute_C_and_J(self):
+        if len(self._packed_realizations) != self.n_realizations:
+            self._pack_realizations()
         d = self.n_nodes
         self.C = np.zeros((d, d), dtype=float)
         self._J = np.zeros((self.n_realizations, d, d), dtype=float)
         for day in range(self.n_realizations):
+            events = self._packed_realizations[day]
+            sizes = self._packed_sizes[day]
             C_day = np.zeros((d, d), dtype=float)
             J_day = np.zeros((d, d), dtype=float)
             for i, j in product(range(d), repeat=2):
-                C_day[i, j], J_day[i, j] = self._compute_A_and_I_ij(
-                    self.realizations[day][i],
-                    self.realizations[day][j],
+                C_day[i, j], J_day[i, j] = _cumulant_compute_A_and_I(
+                    events,
+                    sizes,
+                    i,
+                    j,
                     self.end_times[day],
                     self.integration_support,
                     self._L_day[day, j],
@@ -3598,25 +5440,33 @@ class _HawkesCumulantComputer:
             self._J[day] = J_day
 
     def compute_E_c(self):
+        if len(self._packed_realizations) != self.n_realizations:
+            self._pack_realizations()
         d = self.n_nodes
         E_c = np.zeros((d, d, 2), dtype=float)
         for day in range(self.n_realizations):
+            events = self._packed_realizations[day]
+            sizes = self._packed_sizes[day]
             for i in range(d):
                 for j in range(d):
-                    E_c[i, j, 0] += self._compute_E_ijk(
-                        self.realizations[day][i],
-                        self.realizations[day][j],
-                        self.realizations[day][j],
+                    E_c[i, j, 0] += _cumulant_compute_E(
+                        events,
+                        sizes,
+                        i,
+                        j,
+                        j,
                         self.end_times[day],
                         self.integration_support,
                         self._L_day[day, i],
                         self._L_day[day, j],
                         self._J[day, i, j],
                     )
-                    E_c[i, j, 1] += self._compute_E_ijk(
-                        self.realizations[day][j],
-                        self.realizations[day][j],
-                        self.realizations[day][i],
+                    E_c[i, j, 1] += _cumulant_compute_E(
+                        events,
+                        sizes,
+                        j,
+                        j,
+                        i,
                         self.end_times[day],
                         self.integration_support,
                         self._L_day[day, j],
@@ -3628,35 +5478,8 @@ class _HawkesCumulantComputer:
 
     @staticmethod
     def _compute_A_and_I_ij(timestamps_i, timestamps_j, end_time, support, mean_intensity_j):
-        n_j = len(timestamps_j)
-        res_C = 0.0
-        res_J = 0.0
-        width = 2.0 * support
-        trend_C_j = mean_intensity_j * width
-        trend_J_j = mean_intensity_j * width * width
-        last_l = 0
-        for t_i_k in timestamps_i:
-            if t_i_k - support < 0:
-                continue
-            while last_l < n_j and timestamps_j[last_l] <= t_i_k - width:
-                last_l += 1
-            l = last_l
-            timestamps_in_interval = 0
-            sub_res = 0.0
-            while l < n_j:
-                abs_delta = abs(timestamps_j[l] - t_i_k)
-                if abs_delta < width:
-                    sub_res += width - abs_delta
-                    if abs_delta < support:
-                        timestamps_in_interval += 1
-                else:
-                    break
-                l += 1
-            if l == n_j:
-                continue
-            res_C += timestamps_in_interval - trend_C_j
-            res_J += sub_res - trend_J_j
-        return res_C / end_time, res_J / end_time
+        events, sizes = pack_realization([timestamps_i, timestamps_j])
+        return _cumulant_compute_A_and_I(events, sizes, 0, 1, end_time, support, mean_intensity_j)
 
     @staticmethod
     def _compute_E_ijk(
@@ -3669,30 +5492,19 @@ class _HawkesCumulantComputer:
         mean_intensity_j,
         J_ij,
     ):
-        n_i = len(timestamps_i)
-        n_j = len(timestamps_j)
-        res = 0.0
-        last_l = 0
-        last_m = 0
-        trend_i = mean_intensity_i * 2.0 * support
-        trend_j = mean_intensity_j * 2.0 * support
-        for tau in timestamps_k:
-            if tau - support < 0:
-                continue
-            while last_l < n_i and timestamps_i[last_l] <= tau - support:
-                last_l += 1
-            l = last_l
-            while l < n_i and timestamps_i[l] < tau + support:
-                l += 1
-            while last_m < n_j and timestamps_j[last_m] <= tau - support:
-                last_m += 1
-            m = last_m
-            while m < n_j and timestamps_j[m] < tau + support:
-                m += 1
-            if m == n_j or l == n_i:
-                continue
-            res += (l - last_l - trend_i) * (m - last_m - trend_j) - J_ij
-        return res / end_time
+        events, sizes = pack_realization([timestamps_i, timestamps_j, timestamps_k])
+        return _cumulant_compute_E(
+            events,
+            sizes,
+            0,
+            1,
+            2,
+            end_time,
+            support,
+            mean_intensity_i,
+            mean_intensity_j,
+            J_ij,
+        )
 
 
 class HawkesCumulantMatching(_LearnerBase):

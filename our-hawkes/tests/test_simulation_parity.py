@@ -203,6 +203,11 @@ class SimulationParityTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "end_time must have length 4"):
             first.end_time = [30.0]
 
+        threaded = SimuHawkesMulti(build_base(), n_simulations=3, n_threads=2).simulate()
+        self.assertEqual(threaded.simulation_time, [20.0] * 3)
+        self.assertEqual(threaded.n_nodes, [2] * 3)
+        self.assertTrue(all(np.isfinite(count) for count in threaded.n_total_jumps))
+
 
 if __name__ == "__main__":
     unittest.main()

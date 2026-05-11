@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import warnings
 from itertools import product
 from typing import Any
@@ -14,13 +13,19 @@ from our_hawkes.base import BaseEstimator, normalize_events
 
 from .numeric import (
     exp_feature_at_time,
+    exp_loglik_grad_scan,
     exp_loglik_loss_scan,
+    exp_ls_statistics as numeric_exp_ls_statistics,
     exp_primitive_sum,
+    feature_product_integral as numeric_feature_product_integral,
     finite_difference_grad,
     finite_difference_hessian,
     pack_realization,
     sumexp_feature_at_time,
+    sumexp_loglik_grad_scan,
     sumexp_loglik_loss_scan,
+    sumexp_ls_event_feature_sums as numeric_sumexp_ls_event_feature_sums,
+    sumexp_ls_integral_statistics as numeric_sumexp_ls_integral_statistics,
     sumexp_primitive_sum,
 )
 
@@ -432,23 +437,8 @@ def _exp_loglik_loss_one(realization, end_time, baseline, adjacency, decays):
 
 
 def _exp_loglik_grad_one(realization, end_time, baseline, adjacency, decays):
-    n_nodes = baseline.size
-    grad_baseline = np.full(n_nodes, end_time, dtype=float)
-    grad_adjacency = np.empty((n_nodes, n_nodes), dtype=float)
-    for i, j in product(range(n_nodes), range(n_nodes)):
-        grad_adjacency[i, j] = exp_primitive_sum(end_time, realization[j], decays[i, j])
-    for i in range(n_nodes):
-        for t in realization[i]:
-            features = np.empty(n_nodes, dtype=float)
-            intensity = baseline[i]
-            for j in range(n_nodes):
-                features[j] = exp_feature_at_time(float(t), realization[j], decays[i, j])
-                intensity += adjacency[i, j] * features[j]
-            if intensity <= 0:
-                continue
-            grad_baseline[i] -= 1.0 / intensity
-            grad_adjacency[i, :] -= features / intensity
-    return grad_baseline, grad_adjacency
+    events, sizes = pack_realization(realization)
+    return exp_loglik_grad_scan(events, sizes, end_time, baseline, adjacency, decays)
 
 
 def _sumexp_loglik_loss_one(realization, end_time, baseline, adjacency, decays):
@@ -457,28 +447,8 @@ def _sumexp_loglik_loss_one(realization, end_time, baseline, adjacency, decays):
 
 
 def _sumexp_loglik_grad_one(realization, end_time, baseline, adjacency, decays):
-    n_nodes = baseline.size
-    n_decays = decays.size
-    grad_baseline = np.full(n_nodes, end_time, dtype=float)
-    grad_adjacency = np.empty_like(adjacency)
-    tmp = np.empty(n_decays, dtype=float)
-    for i, j in product(range(n_nodes), range(n_nodes)):
-        sumexp_primitive_sum(end_time, realization[j], decays, tmp)
-        grad_adjacency[i, j, :] = tmp
-    features = np.empty(n_decays, dtype=float)
-    event_features = np.empty((n_nodes, n_decays), dtype=float)
-    for i in range(n_nodes):
-        for t in realization[i]:
-            intensity = baseline[i]
-            for j in range(n_nodes):
-                sumexp_feature_at_time(float(t), realization[j], decays, features)
-                event_features[j, :] = features
-                intensity += float(np.dot(adjacency[i, j, :], features))
-            if intensity <= 0:
-                continue
-            grad_baseline[i] -= 1.0 / intensity
-            grad_adjacency[i, :, :] -= event_features / intensity
-    return grad_baseline, grad_adjacency
+    events, sizes = pack_realization(realization)
+    return sumexp_loglik_grad_scan(events, sizes, end_time, baseline, adjacency, decays)
 
 
 def _exp_least_squares_one(realization, end_time, baseline, adjacency, decays):
@@ -522,27 +492,8 @@ def _exp_least_squares_grad_one(realization, end_time, baseline, adjacency, deca
 
 
 def _exp_ls_statistics(realization, end_time, target_decays, target_node):
-    n_nodes = len(realization)
-    feature_integrals = np.empty(n_nodes, dtype=float)
-    event_feature_sums = np.zeros(n_nodes, dtype=float)
-    feature_products = np.empty((n_nodes, n_nodes), dtype=float)
-
-    for j in range(n_nodes):
-        feature_integrals[j] = exp_primitive_sum(end_time, realization[j], target_decays[j])
-        for event_time in realization[target_node]:
-            event_feature_sums[j] += exp_feature_at_time(
-                float(event_time), realization[j], target_decays[j]
-            )
-
-    for j, k in product(range(n_nodes), range(n_nodes)):
-        feature_products[j, k] = _feature_product_integral(
-            end_time,
-            realization[j],
-            float(target_decays[j]),
-            realization[k],
-            float(target_decays[k]),
-        )
-    return feature_integrals, feature_products, event_feature_sums
+    events, sizes = pack_realization(realization)
+    return numeric_exp_ls_statistics(events, sizes, end_time, target_decays, target_node)
 
 
 def _sumexp_least_squares_one(realization, end_time, baseline, adjacency, decays, period_length):
@@ -600,66 +551,17 @@ def _sumexp_least_squares_grad_one(realization, end_time, baseline, adjacency, d
 
 
 def _sumexp_ls_integral_statistics(realization, end_time, decays):
-    n_nodes = len(realization)
-    n_decays = decays.size
-    feature_integrals = np.empty((n_nodes, n_decays), dtype=float)
-    tmp = np.empty(n_decays, dtype=float)
-    for j in range(n_nodes):
-        sumexp_primitive_sum(end_time, realization[j], decays, tmp)
-        feature_integrals[j, :] = tmp
-
-    n_features = n_nodes * n_decays
-    feature_products = np.empty((n_features, n_features), dtype=float)
-    for j, u, k, v in product(range(n_nodes), range(n_decays), range(n_nodes), range(n_decays)):
-        left = j * n_decays + u
-        right = k * n_decays + v
-        feature_products[left, right] = _feature_product_integral(
-            end_time,
-            realization[j],
-            float(decays[u]),
-            realization[k],
-            float(decays[v]),
-        )
-    return feature_integrals, feature_products
+    events, sizes = pack_realization(realization)
+    return numeric_sumexp_ls_integral_statistics(events, sizes, end_time, decays)
 
 
 def _sumexp_ls_event_feature_sums(realization, decays, target_node):
-    n_nodes = len(realization)
-    n_decays = decays.size
-    event_feature_sums = np.zeros((n_nodes, n_decays), dtype=float)
-    features = np.empty(n_decays, dtype=float)
-    for event_time in realization[target_node]:
-        for j in range(n_nodes):
-            sumexp_feature_at_time(float(event_time), realization[j], decays, features)
-            event_feature_sums[j, :] += features
-    return event_feature_sums
+    events, sizes = pack_realization(realization)
+    return numeric_sumexp_ls_event_feature_sums(events, sizes, decays, target_node)
 
 
 def _feature_product_integral(end_time, timestamps_a, decay_a, timestamps_b, decay_b):
-    if decay_a <= 0.0 or decay_b <= 0.0:
-        return 0.0
-    rate = decay_a + decay_b
-    value = 0.0
-    for ta in timestamps_a:
-        ta = float(ta)
-        if ta >= end_time:
-            break
-        for tb in timestamps_b:
-            tb = float(tb)
-            if tb >= end_time:
-                break
-            start = max(ta, tb)
-            remaining = end_time - start
-            if remaining <= 0.0:
-                continue
-            value += (
-                decay_a
-                * decay_b
-                * math.exp(-decay_a * (start - ta) - decay_b * (start - tb))
-                * (-math.expm1(-rate * remaining))
-                / rate
-            )
-    return float(value)
+    return numeric_feature_product_integral(end_time, timestamps_a, decay_a, timestamps_b, decay_b)
 
 
 def _sumexp_least_squares_one_quad(realization, end_time, baseline, adjacency, decays, period_length):

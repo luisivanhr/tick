@@ -23,3 +23,23 @@ and 6 `skip_optional_backend`.
 Top-level export parity: every name in the local `tick.hawkes.__all__` is
 available from `our_hawkes.hawkes`. Extra convenience exports are
 `TimeFunction` and `HawkesKernel`.
+
+Optional Numba acceleration is deliberately outside the equivalence ledger:
+Python/NumPy formulas remain the reference path, the package imports without
+Numba, and `OUR_HAWKES_DISABLE_NUMBA=1` forces fallback dispatch for parity
+testing. Benchmark smoke coverage reports cold, warm, and reference timings but
+does not enforce wall-clock thresholds:
+
+```powershell
+& "C:\Users\luisi\Documents\Programming\Python\.misc314\Scripts\python.exe" benchmarks\benchmark_numba_hot_paths.py
+& "C:\Users\luisi\Documents\Programming\Python\.misc314\Scripts\python.exe" -m unittest discover -s tests -p test_benchmark_smoke.py
+```
+
+First calls into JIT-backed helpers include compile latency, so benchmark output
+separates cold, warm, and disabled-JIT reference timings. Numba may write
+`.nbc` / `.nbi` cache files near `__pycache__`; on Windows, cache path or
+permission issues should be handled by disabling JIT with
+`OUR_HAWKES_DISABLE_NUMBA=1`, not by changing numerical assertions. The
+preserved release ledger remains 165 `pass`, 0 `xfail_equivalence_gap`, and 6
+`skip_optional_backend`. Tick-equivalence status: 165 pass, 0 xfail, 6 optional
+skips.
